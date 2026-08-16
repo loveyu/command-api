@@ -11,14 +11,21 @@ permissions:
 
 jobs:
   quality:
-    name: ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
-        os:
-          - ubuntu-latest
-          - windows-latest
+        include:
+          - name: Linux x86_64
+            runner: ubuntu-latest
+          - name: Linux ARM64
+            runner: ubuntu-24.04-arm
+          - name: Windows x86_64
+            runner: windows-latest
+            artifact: windows-x86_64-ci
+          - name: Windows ARM64
+            runner: windows-11-arm
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -34,9 +41,26 @@ jobs:
       - name: Build release binary
         run: cargo build --release --locked
       - name: Upload Windows test binary
-        if: runner.os == 'Windows'
+        if: matrix.artifact
         uses: actions/upload-artifact@v4
         with:
-          name: windows-x86_64-ci
+          name: ${{ matrix.artifact }}
           path: target/release/command-api.exe
           if-no-files-found: error
+
+  build-linux-armv7:
+    name: Linux ARMv7 cross-build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ARMv7 linker
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes gcc-arm-linux-gnueabihf
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: armv7-unknown-linux-gnueabihf
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: armv7-unknown-linux-gnueabihf
+      - run: cargo build --release --locked --target armv7-unknown-linux-gnueabihf

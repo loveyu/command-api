@@ -10,14 +10,20 @@ permissions:
 
 jobs:
   verify:
-    name: Verify ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
+    name: Verify ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
-        os:
-          - ubuntu-latest
-          - windows-latest
+        include:
+          - name: Linux x86_64
+            runner: ubuntu-latest
+          - name: Linux ARM64
+            runner: ubuntu-24.04-arm
+          - name: Windows x86_64
+            runner: windows-latest
+          - name: Windows ARM64
+            runner: windows-11-arm
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -29,47 +35,84 @@ jobs:
       - run: cargo clippy --locked --all-targets -- -D warnings
 
   build-linux:
-    name: Build Linux x86_64
+    name: Build ${{ matrix.package }}
     needs: verify
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            package: linux-x86_64
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            package: linux-aarch64
+          - runner: ubuntu-latest
+            target: armv7-unknown-linux-gnueabihf
+            package: linux-armv7
+            apt_package: gcc-arm-linux-gnueabihf
     steps:
       - uses: actions/checkout@v4
+      - name: Install cross linker
+        if: matrix.apt_package
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes "${{ matrix.apt_package }}"
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release --locked
+        with:
+          key: ${{ matrix.target }}
+      - run: cargo build --release --locked --target "${{ matrix.target }}"
       - name: Package
         shell: bash
         run: |
           mkdir -p dist/package/scripts
-          cp target/release/command-api dist/package/
+          cp "target/${{ matrix.target }}/release/command-api" dist/package/
           cp README.md config.example.yaml dist/package/
           cp scripts/example.sh scripts/example.ps1 dist/package/scripts/
-          tar -C dist/package -czf "dist/command-api-${GITHUB_REF_NAME}-linux-x86_64.tar.gz" .
+          tar -C dist/package -czf "dist/command-api-${GITHUB_REF_NAME}-${{ matrix.package }}.tar.gz" .
       - uses: actions/upload-artifact@v4
         with:
-          name: linux-x86_64
+          name: ${{ matrix.package }}
           path: dist/*.tar.gz
 
   build-windows:
-    name: Build Windows x86_64
+    name: Build ${{ matrix.package }}
     needs: verify
-    runs-on: windows-latest
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            package: windows-x86_64
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            package: windows-aarch64
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release --locked
+        with:
+          key: ${{ matrix.target }}
+      - run: cargo build --release --locked --target "${{ matrix.target }}"
       - name: Package
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist/package/scripts | Out-Null
-          Copy-Item target/release/command-api.exe dist/package/
+          Copy-Item "target/${{ matrix.target }}/release/command-api.exe" dist/package/
           Copy-Item README.md,config.example.yaml dist/package/
           Copy-Item scripts/example.sh,scripts/example.ps1 dist/package/scripts/
-          Compress-Archive -Path dist/package/* -DestinationPath "dist/command-api-$env:GITHUB_REF_NAME-windows-x86_64.zip"
+          Compress-Archive -Path dist/package/* -DestinationPath "dist/command-api-$env:GITHUB_REF_NAME-${{ matrix.package }}.zip"
       - uses: actions/upload-artifact@v4
         with:
-          name: windows-x86_64
+          name: ${{ matrix.package }}
           path: dist/*.zip
 
   publish:

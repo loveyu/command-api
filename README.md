@@ -6,11 +6,12 @@
 
 ## 平台支持
 
-- Linux x86_64
-- Windows 10 或更高版本
-- Windows Server 2016 或更高版本
-- Windows x86_64 MSVC
+- Linux x86_64、ARM64（AArch64）和 ARMv7 hard-float（glibc）
+- Windows x86_64 和 ARM64（MSVC）
+- Windows 10 或更高版本；Windows Server 2016 或更高版本
 - Windows 命令行前台模式和 Windows Service 模式
+
+GitHub Release 分别提供 `linux-x86_64`、`linux-aarch64`、`linux-armv7`、`windows-x86_64` 和 `windows-aarch64` 安装包。CI 在 x86_64 与 ARM64 原生 Runner 上执行完整测试；Linux ARMv7 执行交叉编译校验。
 
 Linux 使用独立进程组管理脚本及子进程；Windows 使用 Job Object。任务超时、主动取消或服务停止时，服务先请求整个进程树平滑退出，等待配置的宽限期，仍未退出再强制终止。
 
