@@ -124,7 +124,11 @@ mod windows {
         };
         let service = manager.create_service(
             &info,
-            ServiceAccess::QUERY_STATUS | ServiceAccess::START | ServiceAccess::STOP | ServiceAccess::DELETE,
+            ServiceAccess::QUERY_STATUS
+                | ServiceAccess::START
+                | ServiceAccess::STOP
+                | ServiceAccess::DELETE
+                | ServiceAccess::CHANGE_CONFIG,
         )?;
         service.set_description(config.windows_service.description)?;
         Ok(())
