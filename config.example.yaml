@@ -28,6 +28,10 @@ auth:
   token:
     provider: environment
     variable: COMMAND_API_TOKEN
+  # 也可以将标准 PBKDF2-HMAC-SHA256 PHC Hash 直接保存在配置中；使用 secret hash 生成。
+  # token:
+  #   provider: pbkdf2_sha256
+  #   hash: '$pbkdf2-sha256$i=600000,l=32$...'
   # Windows 推荐改用以下 DPAPI 密钥文件：
   # token:
   #   provider: windows_dpapi

@@ -1,11 +1,115 @@
 use anyhow::{Context, Result, bail};
-use std::{fs, path::Path};
+use pbkdf2::{
+    Params, Pbkdf2,
+    password_hash::{PasswordHasher, PasswordVerifier, phc::PasswordHash},
+};
+use sha2::{Digest, Sha256};
+use std::{
+    fs,
+    path::Path,
+    sync::{Arc, OnceLock},
+};
+use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 pub enum DpapiScope {
     User,
     Machine,
+}
+
+#[derive(Clone)]
+pub enum TokenVerifier {
+    Sha256(Zeroizing<[u8; 32]>),
+    Pbkdf2Sha256 {
+        phc: Zeroizing<String>,
+        successful_fingerprint: Arc<OnceLock<Zeroizing<[u8; 32]>>>,
+    },
+}
+
+impl std::fmt::Debug for TokenVerifier {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("TokenVerifier([REDACTED])")
+    }
+}
+
+impl TokenVerifier {
+    pub fn from_token(token: &str) -> Self {
+        Self::Sha256(Zeroizing::new(token_fingerprint(token)))
+    }
+
+    pub fn from_pbkdf2_sha256(phc: String) -> Result<Self> {
+        validate_pbkdf2_sha256(&phc)?;
+        Ok(Self::Pbkdf2Sha256 {
+            phc: Zeroizing::new(phc),
+            successful_fingerprint: Arc::new(OnceLock::new()),
+        })
+    }
+
+    pub async fn verify(&self, token: &str) -> bool {
+        if token.len() > 4096 || token.contains(['\r', '\n', '\0']) {
+            return false;
+        }
+        let supplied = token_fingerprint(token);
+        match self {
+            Self::Sha256(expected) => supplied.ct_eq(expected.as_ref()).into(),
+            Self::Pbkdf2Sha256 {
+                phc,
+                successful_fingerprint,
+            } => {
+                if let Some(expected) = successful_fingerprint.get() {
+                    return supplied.ct_eq(expected.as_ref()).into();
+                }
+
+                let phc = phc.clone();
+                let token = Zeroizing::new(token.to_owned());
+                let verified = tokio::task::spawn_blocking(move || {
+                    let Ok(parsed) = PasswordHash::new(&phc) else {
+                        return false;
+                    };
+                    Pbkdf2::SHA256.verify_password(token.as_bytes(), &parsed).is_ok()
+                })
+                .await
+                .unwrap_or(false);
+                if verified {
+                    let _ = successful_fingerprint.set(Zeroizing::new(supplied));
+                }
+                verified
+            }
+        }
+    }
+}
+
+pub fn generate_pbkdf2_sha256(token: &str) -> Result<String> {
+    validate_token(token)?;
+    let hash = Pbkdf2::SHA256
+        .hash_password(token.as_bytes())
+        .map_err(|error| anyhow::anyhow!("无法生成 PBKDF2-HMAC-SHA256 Hash: {error}"))?;
+    Ok(hash.to_string())
+}
+
+fn validate_pbkdf2_sha256(phc: &str) -> Result<()> {
+    let hash =
+        PasswordHash::new(phc).map_err(|error| anyhow::anyhow!("auth.token.hash 不是有效 PHC 字符串: {error}"))?;
+    if hash.algorithm.as_str() != "pbkdf2-sha256" {
+        bail!("auth.token.hash 必须使用 pbkdf2-sha256 算法");
+    }
+    if hash.salt.is_none() || hash.hash.is_none() {
+        bail!("auth.token.hash 必须包含 salt 和摘要");
+    }
+    let params =
+        Params::try_from(&hash).map_err(|error| anyhow::anyhow!("auth.token.hash 的 PBKDF2 参数无效: {error}"))?;
+    if params.output_len() != Params::RECOMMENDED_OUTPUT_LENGTH {
+        bail!("auth.token.hash 的摘要长度必须为 32 字节");
+    }
+    if params.rounds() > 1_000_000 {
+        bail!("auth.token.hash 的 PBKDF2 迭代次数不能超过 1000000");
+    }
+    Ok(())
+}
+
+fn token_fingerprint(token: &str) -> [u8; 32] {
+    Sha256::digest(token.as_bytes()).into()
 }
 
 pub fn generate_and_protect(output: &Path, scope: DpapiScope) -> Result<String> {
@@ -154,5 +258,27 @@ mod tests {
         assert!(validate_token("short").is_err());
         assert!(validate_token(&"x".repeat(32)).is_ok());
         assert!(validate_token(&("x".repeat(32) + "\n")).is_err());
+    }
+
+    #[tokio::test]
+    async fn pbkdf2_sha256_verifier_accepts_only_the_original_token_and_caches_success() {
+        let token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let hash = generate_pbkdf2_sha256(token).unwrap();
+        assert!(hash.starts_with("$pbkdf2-sha256$i=600000,l=32$"));
+        let verifier = TokenVerifier::from_pbkdf2_sha256(hash).unwrap();
+
+        assert!(verifier.verify(token).await);
+        assert!(
+            !verifier
+                .verify("abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789")
+                .await
+        );
+        assert!(verifier.verify(token).await);
+    }
+
+    #[test]
+    fn pbkdf2_sha256_rejects_invalid_or_different_phc_algorithms() {
+        assert!(TokenVerifier::from_pbkdf2_sha256("not-a-phc-string".to_owned()).is_err());
+        assert!(TokenVerifier::from_pbkdf2_sha256("$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$YWJjZA".to_owned()).is_err());
     }
 }

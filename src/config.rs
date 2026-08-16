@@ -74,6 +74,7 @@ pub struct AuthConfig {
 pub enum TokenSource {
     Environment { variable: String },
     WindowsDpapi { file: PathBuf },
+    Pbkdf2Sha256 { hash: String },
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -334,7 +335,7 @@ pub struct ResolvedTlsConfig {
 
 #[derive(Clone)]
 pub struct ResolvedAuthConfig {
-    pub token: Zeroizing<String>,
+    pub token: crate::secret::TokenVerifier,
 }
 
 impl std::fmt::Debug for ResolvedAuthConfig {
@@ -397,7 +398,7 @@ impl Config {
 
         let base = source_path.parent().context("配置文件没有父目录")?;
         let auth = ResolvedAuthConfig {
-            token: Zeroizing::new(resolve_token(base, self.auth.token)?),
+            token: resolve_token(base, self.auth.token)?,
         };
         let tls = resolve_tls(base, self.tls)?;
         let log_directory = absolute_from(base, &self.logging.directory);
@@ -604,8 +605,8 @@ fn validate_service_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn resolve_token(base: &Path, source: TokenSource) -> Result<String> {
-    let token = match source {
+fn resolve_token(base: &Path, source: TokenSource) -> Result<crate::secret::TokenVerifier> {
+    let token = Zeroizing::new(match source {
         TokenSource::Environment { variable } => {
             if variable.trim().is_empty() || variable.contains(['=', '\0']) {
                 bail!("auth.token.variable 非法");
@@ -617,9 +618,12 @@ fn resolve_token(base: &Path, source: TokenSource) -> Result<String> {
             let path = fs::canonicalize(&path).with_context(|| format!("DPAPI 密钥文件不存在: {}", path.display()))?;
             crate::secret::unprotect_from_file(&path)?
         }
-    };
+        TokenSource::Pbkdf2Sha256 { hash } => {
+            return crate::secret::TokenVerifier::from_pbkdf2_sha256(hash);
+        }
+    });
     crate::secret::validate_token(&token)?;
-    Ok(token)
+    Ok(crate::secret::TokenVerifier::from_token(&token))
 }
 
 fn resolve_tls(base: &Path, tls: Option<TlsConfig>) -> Result<Option<ResolvedTlsConfig>> {

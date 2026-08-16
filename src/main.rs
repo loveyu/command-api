@@ -11,6 +11,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use config::DEFAULT_CONFIG_PATH;
 use std::{io::Read, path::PathBuf, process::ExitCode};
+use zeroize::Zeroizing;
 
 #[derive(Debug, Parser)]
 #[command(name = "command-api", version, about)]
@@ -31,7 +32,7 @@ enum Command {
         #[command(subcommand)]
         action: ServiceAction,
     },
-    /// 生成或导入 Windows DPAPI 加密 Token
+    /// 生成 Token Hash，或生成、导入 Windows DPAPI 加密 Token
     Secret {
         #[command(subcommand)]
         action: SecretAction,
@@ -53,6 +54,12 @@ enum SecretAction {
         output: PathBuf,
         #[arg(long, value_enum, default_value = "user")]
         scope: secret::DpapiScope,
+        #[arg(long)]
+        stdin: bool,
+    },
+    /// 读取 Token，生成标准 PBKDF2-HMAC-SHA256 PHC Hash 并输出 YAML 配置
+    Hash {
+        /// 从标准输入读取 Token；默认在终端隐藏输入并要求确认
         #[arg(long)]
         stdin: bool,
     },
@@ -124,18 +131,29 @@ fn run() -> Result<()> {
                 Ok(())
             }
             SecretAction::Protect { output, scope, stdin } => {
-                let token = if stdin {
-                    let mut value = String::new();
-                    std::io::stdin().read_to_string(&mut value)?;
-                    value.trim_end_matches(['\r', '\n']).to_owned()
-                } else {
-                    let first = rpassword::prompt_password("Token: ")?;
-                    let second = rpassword::prompt_password("再次输入 Token: ")?;
-                    anyhow::ensure!(first == second, "两次输入的 Token 不一致");
-                    first
-                };
+                let token = read_token(stdin)?;
                 secret::protect_to_file(token.as_bytes(), &output, scope)
             }
+            SecretAction::Hash { stdin } => {
+                let token = read_token(stdin)?;
+                let hash = secret::generate_pbkdf2_sha256(&token)?;
+                println!("auth:\n  token:\n    provider: pbkdf2_sha256\n    hash: \"{hash}\"");
+                Ok(())
+            }
         },
+    }
+}
+
+fn read_token(stdin: bool) -> Result<Zeroizing<String>> {
+    if stdin {
+        let mut value = String::new();
+        std::io::stdin().read_to_string(&mut value)?;
+        value.truncate(value.trim_end_matches(['\r', '\n']).len());
+        Ok(Zeroizing::new(value))
+    } else {
+        let first = Zeroizing::new(rpassword::prompt_password("Token: ")?);
+        let second = Zeroizing::new(rpassword::prompt_password("再次输入 Token: ")?);
+        anyhow::ensure!(first == second, "两次输入的 Token 不一致");
+        Ok(first)
     }
 }

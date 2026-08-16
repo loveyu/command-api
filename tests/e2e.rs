@@ -3,6 +3,7 @@ use reqwest::{Certificate, Client, Identity, StatusCode};
 use serde_json::{Value, json};
 use std::{
     fs,
+    io::Write,
     net::TcpListener,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -500,6 +501,32 @@ async fn requires_a_trusted_mtls_client_certificate() {
         .await
         .unwrap();
     assert_eq!(valid.status(), StatusCode::OK);
+}
+
+#[test]
+fn pbkdf2_sha256_cli_outputs_a_complete_phc_yaml_fragment_without_the_token() {
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let mut child = Command::new(env!("CARGO_BIN_EXE_command-api"))
+        .args(["secret", "hash", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(TOKEN.as_bytes()).unwrap();
+    let output = child.wait_with_output().unwrap();
+
+    assert!(output.status.success());
+    let yaml = String::from_utf8(output.stdout).unwrap();
+    assert!(!yaml.contains(TOKEN));
+    let value: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+    let token = &value["auth"]["token"];
+    assert_eq!(token["provider"].as_str(), Some("pbkdf2_sha256"));
+    assert!(
+        token["hash"]
+            .as_str()
+            .unwrap()
+            .starts_with("$pbkdf2-sha256$i=600000,l=32$")
+    );
 }
 
 fn test_pki() -> (Vec<u8>, String, String, Vec<u8>) {

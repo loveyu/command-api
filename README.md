@@ -91,7 +91,7 @@ routes:
 
 ### Token 密钥
 
-YAML 不接受明文 Token，只支持以下提供器：
+YAML 不接受明文 Token，支持以下三种提供器：
 
 ```yaml
 # 跨平台：从进程环境读取
@@ -100,12 +100,30 @@ auth:
     provider: environment
     variable: COMMAND_API_TOKEN
 
+# 跨平台：配置中只保存标准 PBKDF2-HMAC-SHA256 PHC Hash
+auth:
+  token:
+    provider: pbkdf2_sha256
+    hash: '$pbkdf2-sha256$i=600000,l=32$替换为salt$替换为摘要'
+
 # Windows：从 DPAPI 密文文件读取
 auth:
   token:
     provider: windows_dpapi
     file: ./secrets/token.dpapi
 ```
+
+使用内置命令隐藏输入现有 Token 并生成完整 YAML 片段：
+
+```bash
+command-api secret hash
+# 自动化场景可以从标准输入读取；调用方应避免把 Token 写入命令行参数或日志
+printf '%s' "$COMMAND_API_TOKEN" | command-api secret hash --stdin
+```
+
+`pbkdf2_sha256` 使用 [RFC 8018](https://www.rfc-editor.org/rfc/rfc8018) 的 PBKDF2-HMAC-SHA256，并以 [PHC 字符串规范](https://github.com/P-H-C/phc-string-format/blob/master/phc-sf-spec.md)统一保存算法、迭代参数、随机 salt 和摘要，避免项目自行定义拼接与编码规则。内置命令使用 600000 次迭代、32 字节摘要和随机 salt；服务接受 PBKDF2 规范允许且不超过 1000000 次的参数，并要求 32 字节摘要。首次成功认证会缓存该 Token 的 SHA-256 内存指纹，后续请求使用常量时间快速校验；PBKDF2 校验在线程池执行，不阻塞异步 HTTP 运行时。配置和服务长期状态均不保留可还原的 Token，请求处理中产生的临时 Token 副本会在使用后清零。更换 Token 时需要重新生成 PHC Hash，然后重启或调用 `/system/restart` 重新加载配置。
+
+内置工具仍要求至少 32 字节的高熵 Token。PHC Hash 和 salt 不需要保密，但应防止被复制后离线穷举；不要把用户密码或短口令当作 Token。若已有操作系统密钥存储，仍优先使用环境密钥注入或 Windows DPAPI。
 
 Windows 可以生成强随机 Token，并按当前用户或整机作用域保护：
 

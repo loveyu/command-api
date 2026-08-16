@@ -17,7 +17,6 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     net::{IpAddr, SocketAddr},
@@ -28,13 +27,13 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use subtle::ConstantTimeEq;
 use tokio::sync::{Mutex, Semaphore, mpsc};
 use tower_http::{limit::RequestBodyLimitLayer, trace::TraceLayer};
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 pub struct AppState {
-    token_hash: [u8; 32],
+    token: crate::secret::TokenVerifier,
     allowed_cidrs: Vec<ipnet::IpNet>,
     token_failure_cooldown: TokenFailureCooldownConfig,
     auth_failures: Mutex<HashMap<IpAddr, Instant>>,
@@ -69,9 +68,8 @@ pub fn build(config: &ResolvedConfig, store: Arc<TaskStore>, management_tx: mpsc
             )
         })
         .collect();
-    let token_hash: [u8; 32] = Sha256::digest(config.auth.token.as_bytes()).into();
     let state = Arc::new(AppState {
-        token_hash,
+        token: config.auth.token.clone(),
         allowed_cidrs: config.access.allowed_cidrs.clone(),
         token_failure_cooldown: config.access.token_failure_cooldown.clone(),
         auth_failures: Mutex::new(HashMap::new()),
@@ -135,16 +133,16 @@ async fn authenticate(State(state): State<Arc<AppState>>, request: Request<Body>
         return response;
     }
 
-    let authorized = request
+    let token = request
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
-        .map(|token| {
-            let supplied: [u8; 32] = Sha256::digest(token.as_bytes()).into();
-            supplied.ct_eq(&state.token_hash).into()
-        })
-        .unwrap_or(false);
+        .map(|token| Zeroizing::new(token.to_owned()));
+    let authorized = match token {
+        Some(token) => state.token.verify(&token).await,
+        None => false,
+    };
     if authorized {
         return next.run(request).await;
     }
@@ -457,9 +455,7 @@ mod tests {
     #[tokio::test]
     async fn every_endpoint_requires_authentication() {
         const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        unsafe {
-            std::env::set_var("COMMAND_API_APP_TEST_TOKEN", TOKEN);
-        }
+        let hash = crate::secret::generate_pbkdf2_sha256(TOKEN).unwrap();
         let temp = tempfile::tempdir().unwrap();
         let config_path = temp.path().join("config.yaml");
         let script = temp.path().join("test.sh");
@@ -475,8 +471,8 @@ access:
     seconds: 10
 auth:
   token:
-    provider: environment
-    variable: COMMAND_API_APP_TEST_TOKEN
+    provider: pbkdf2_sha256
+    hash: "{hash}"
 logging: {{ directory: logs }}
 routes:
   - path: /run
