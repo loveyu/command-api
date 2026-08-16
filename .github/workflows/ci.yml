@@ -31,3 +31,12 @@ jobs:
         run: cargo test --locked
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Build release binary
+        run: cargo build --release --locked
+      - name: Upload Windows test binary
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-x86_64-ci
+          path: target/release/command-api.exe
+          if-no-files-found: error

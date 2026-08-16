@@ -177,7 +177,11 @@ async fn executes_arguments_captures_streams_merges_and_times_out() {
     let accepted: Value = response.json().await.unwrap();
     let id = accepted["task_id"].as_str().unwrap();
     let task = server.wait_finished(id).await;
-    assert_eq!(task["status"], "succeeded");
+    if task["status"] != "succeeded" {
+        let stdout = server.output(id, "stdout").await;
+        let stderr = server.output(id, "stderr").await;
+        panic!("task failed: {task:#}; stdout: {stdout:#}; stderr: {stderr:#}");
+    }
     let stdout = server.output(id, "stdout").await;
     let stderr = server.output(id, "stderr").await;
     assert!(

@@ -67,8 +67,8 @@ routes:
 | `sh` | `sh` | `sh <script> <fixed_args> <request_args>` |
 | `bash` | `bash` | `bash <script> ...` |
 | `zsh` | `zsh` | `zsh <script> ...` |
-| `pwsh` | `pwsh` | `pwsh -NoLogo -NoProfile -NonInteractive -File <script> ...` |
-| `powershell` | `powershell.exe` | Windows PowerShell 5.1 `-File` 模式 |
+| `pwsh` | `pwsh` | `pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File <script> ...` |
+| `powershell` | `powershell.exe` | Windows PowerShell 5.1 `-ExecutionPolicy Bypass -File` 模式 |
 | `cmd` | `cmd.exe` | 仅允许配置固定参数，不允许 HTTP 动态参数 |
 
 可以使用 `program` 为某条路由指定解释器的绝对路径。Windows 推荐安装并使用 PowerShell 7 `pwsh`；如果 Windows PowerShell 5.1 产生本地编码输出，可将 `output_encoding` 配置为 `gbk` 或 `utf-16le`。

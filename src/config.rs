@@ -166,7 +166,14 @@ impl Executor {
 
     pub fn launcher_args(self) -> &'static [&'static str] {
         match self {
-            Self::Pwsh | Self::Powershell => &["-NoLogo", "-NoProfile", "-NonInteractive", "-File"],
+            Self::Pwsh | Self::Powershell => &[
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+            ],
             Self::Cmd => &["/D", "/S", "/C"],
             Self::Sh | Self::Bash | Self::Zsh => &[],
         }
@@ -484,7 +491,14 @@ mod tests {
     fn executor_argument_order_is_stable() {
         assert_eq!(
             Executor::Pwsh.launcher_args(),
-            ["-NoLogo", "-NoProfile", "-NonInteractive", "-File"]
+            [
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File"
+            ]
         );
         assert_eq!(Executor::Bash.launcher_args(), [] as [&str; 0]);
     }
