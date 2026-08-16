@@ -119,6 +119,8 @@ auth:
 command-api secret hash
 # 自动化场景可以从标准输入读取；调用方应避免把 Token 写入命令行参数或日志
 printf '%s' "$COMMAND_API_TOKEN" | command-api secret hash --stdin
+# 可按机器性能调整迭代次数，允许范围 1000～1000000；不指定时为 600000
+command-api secret hash --rounds 600000
 ```
 
 `pbkdf2_sha256` 使用 [RFC 8018](https://www.rfc-editor.org/rfc/rfc8018) 的 PBKDF2-HMAC-SHA256，并以 [PHC 字符串规范](https://github.com/P-H-C/phc-string-format/blob/master/phc-sf-spec.md)统一保存算法、迭代参数、随机 salt 和摘要，避免项目自行定义拼接与编码规则。内置命令使用 600000 次迭代、32 字节摘要和随机 salt；服务接受 PBKDF2 规范允许且不超过 1000000 次的参数，并要求 32 字节摘要。首次成功认证会缓存该 Token 的 SHA-256 内存指纹，后续请求使用常量时间快速校验；PBKDF2 校验在线程池执行，不阻塞异步 HTTP 运行时。配置和服务长期状态均不保留可还原的 Token，请求处理中产生的临时 Token 副本会在使用后清零。更换 Token 时需要重新生成 PHC Hash，然后重启或调用 `/system/restart` 重新加载配置。

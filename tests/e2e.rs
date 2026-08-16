@@ -507,7 +507,7 @@ async fn requires_a_trusted_mtls_client_certificate() {
 fn pbkdf2_sha256_cli_outputs_a_complete_phc_yaml_fragment_without_the_token() {
     const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     let mut child = Command::new(env!("CARGO_BIN_EXE_command-api"))
-        .args(["secret", "hash", "--stdin"])
+        .args(["secret", "hash", "--stdin", "--rounds", "1000"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -525,7 +525,7 @@ fn pbkdf2_sha256_cli_outputs_a_complete_phc_yaml_fragment_without_the_token() {
         token["hash"]
             .as_str()
             .unwrap()
-            .starts_with("$pbkdf2-sha256$i=600000,l=32$")
+            .starts_with("$pbkdf2-sha256$i=1000,l=32$")
     );
 }
 

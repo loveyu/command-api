@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use pbkdf2::{
-    Params, Pbkdf2,
+    Algorithm, Params, Pbkdf2,
     password_hash::{PasswordHasher, PasswordVerifier, phc::PasswordHash},
 };
 use sha2::{Digest, Sha256};
@@ -11,6 +11,10 @@ use std::{
 };
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
+
+pub const DEFAULT_PBKDF2_SHA256_ROUNDS: u32 = Params::RECOMMENDED_ROUNDS;
+pub const MIN_PBKDF2_SHA256_ROUNDS: u32 = Params::MIN_ROUNDS;
+pub const MAX_PBKDF2_SHA256_ROUNDS: u32 = 1_000_000;
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 pub enum DpapiScope {
@@ -80,9 +84,14 @@ impl TokenVerifier {
     }
 }
 
-pub fn generate_pbkdf2_sha256(token: &str) -> Result<String> {
+pub fn generate_pbkdf2_sha256(token: &str, rounds: u32) -> Result<String> {
     validate_token(token)?;
-    let hash = Pbkdf2::SHA256
+    if rounds > MAX_PBKDF2_SHA256_ROUNDS {
+        bail!("PBKDF2 迭代次数不能超过 {MAX_PBKDF2_SHA256_ROUNDS}");
+    }
+    let params =
+        Params::new(rounds).map_err(|_| anyhow::anyhow!("PBKDF2 迭代次数不能少于 {MIN_PBKDF2_SHA256_ROUNDS}"))?;
+    let hash = Pbkdf2::new(Algorithm::Pbkdf2Sha256, params)
         .hash_password(token.as_bytes())
         .map_err(|error| anyhow::anyhow!("无法生成 PBKDF2-HMAC-SHA256 Hash: {error}"))?;
     Ok(hash.to_string())
@@ -102,8 +111,8 @@ fn validate_pbkdf2_sha256(phc: &str) -> Result<()> {
     if params.output_len() != Params::RECOMMENDED_OUTPUT_LENGTH {
         bail!("auth.token.hash 的摘要长度必须为 32 字节");
     }
-    if params.rounds() > 1_000_000 {
-        bail!("auth.token.hash 的 PBKDF2 迭代次数不能超过 1000000");
+    if params.rounds() > MAX_PBKDF2_SHA256_ROUNDS {
+        bail!("auth.token.hash 的 PBKDF2 迭代次数不能超过 {MAX_PBKDF2_SHA256_ROUNDS}");
     }
     Ok(())
 }
@@ -263,8 +272,8 @@ mod tests {
     #[tokio::test]
     async fn pbkdf2_sha256_verifier_accepts_only_the_original_token_and_caches_success() {
         let token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let hash = generate_pbkdf2_sha256(token).unwrap();
-        assert!(hash.starts_with("$pbkdf2-sha256$i=600000,l=32$"));
+        let hash = generate_pbkdf2_sha256(token, MIN_PBKDF2_SHA256_ROUNDS).unwrap();
+        assert!(hash.starts_with("$pbkdf2-sha256$i=1000,l=32$"));
         let verifier = TokenVerifier::from_pbkdf2_sha256(hash).unwrap();
 
         assert!(verifier.verify(token).await);

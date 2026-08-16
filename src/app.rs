@@ -455,7 +455,7 @@ mod tests {
     #[tokio::test]
     async fn every_endpoint_requires_authentication() {
         const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let hash = crate::secret::generate_pbkdf2_sha256(TOKEN).unwrap();
+        let hash = crate::secret::generate_pbkdf2_sha256(TOKEN, crate::secret::MIN_PBKDF2_SHA256_ROUNDS).unwrap();
         let temp = tempfile::tempdir().unwrap();
         let config_path = temp.path().join("config.yaml");
         let script = temp.path().join("test.sh");

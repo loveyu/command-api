@@ -62,6 +62,9 @@ enum SecretAction {
         /// 从标准输入读取 Token；默认在终端隐藏输入并要求确认
         #[arg(long)]
         stdin: bool,
+        /// PBKDF2 迭代次数
+        #[arg(long, default_value_t = secret::DEFAULT_PBKDF2_SHA256_ROUNDS)]
+        rounds: u32,
     },
 }
 
@@ -134,9 +137,9 @@ fn run() -> Result<()> {
                 let token = read_token(stdin)?;
                 secret::protect_to_file(token.as_bytes(), &output, scope)
             }
-            SecretAction::Hash { stdin } => {
+            SecretAction::Hash { stdin, rounds } => {
                 let token = read_token(stdin)?;
-                let hash = secret::generate_pbkdf2_sha256(&token)?;
+                let hash = secret::generate_pbkdf2_sha256(&token, rounds)?;
                 println!("auth:\n  token:\n    provider: pbkdf2_sha256\n    hash: \"{hash}\"");
                 Ok(())
             }
@@ -155,5 +158,22 @@ fn read_token(stdin: bool) -> Result<Zeroizing<String>> {
         let second = Zeroizing::new(rpassword::prompt_password("再次输入 Token: ")?);
         anyhow::ensure!(first == second, "两次输入的 Token 不一致");
         Ok(first)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn secret_hash_uses_the_recommended_default_rounds() {
+        let cli = Cli::try_parse_from(["command-api", "secret", "hash", "--stdin"]).unwrap();
+        let Command::Secret {
+            action: SecretAction::Hash { rounds, .. },
+        } = cli.command
+        else {
+            panic!("未解析为 secret hash 子命令");
+        };
+        assert_eq!(rounds, secret::DEFAULT_PBKDF2_SHA256_ROUNDS);
     }
 }
