@@ -1,10 +1,14 @@
 server:
-  # 必须是明确的私有、loopback 或 link-local IP；禁止 0.0.0.0、:: 和公网地址。
-  host: 192.168.1.10
-  port: 27415
+  # 每个监听端点可使用不同地址和端口，所有端点共享路由和安全策略。
+  listeners:
+    - host: 192.168.1.10
+      port: 27415
+    - host: 127.0.0.1
+      port: 27416
+  # 旧版 host + port，以及多个地址共用端口的 hosts + port 写法仍兼容。
 
 access:
-  # 至少一个 CIDR，且只能使用私有、loopback 或 link-local 网段。
+  # 至少一个 CIDR。请尽量缩小范围，不建议配置 0.0.0.0/0 或 ::/0。
   allowed_cidrs:
     - 192.168.1.0/24
   token_failure_cooldown:
@@ -12,11 +16,12 @@ access:
     seconds: 10
     max_tracked_ips: 4096
 
-# 非 loopback 监听必须启用 mTLS。证书和私钥路径相对于本配置文件。
-tls:
-  certificate: ./tls/server.crt
-  private_key: ./tls/server.key
-  client_ca_certificate: ./tls/client-ca.crt
+# 未配置 tls 时使用明文 HTTP；需要加密时取消下列注释。启用 TLS 后强制使用 mTLS。
+# 服务器证书必须覆盖全部监听地址，证书和私钥路径相对于本配置文件。
+# tls:
+#   certificate: ./tls/server.crt
+#   private_key: ./tls/server.key
+#   client_ca_certificate: ./tls/client-ca.crt
 
 auth:
   # 跨平台可从进程环境读取，不允许在 YAML 中直接保存 Token。

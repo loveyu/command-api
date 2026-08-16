@@ -15,6 +15,7 @@ struct Server {
     child: Child,
     _temp: TempDir,
     base_url: String,
+    secondary_base_url: String,
     client: Client,
     config_path: PathBuf,
     token: String,
@@ -50,6 +51,7 @@ impl Server {
         const RELOADED_TOKEN: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
         let temp = tempfile::tempdir().unwrap();
         let port = free_port();
+        let secondary_port = distinct_free_port(port);
         let (executor, script_name, script) = test_script();
         let script_path = temp.path().join(script_name);
         fs::write(&script_path, script).unwrap();
@@ -58,8 +60,11 @@ impl Server {
             &config_path,
             format!(
                 r#"server:
-  host: 127.0.0.1
-  port: {port}
+  listeners:
+    - host: 127.0.0.1
+      port: {port}
+    - host: 127.0.0.1
+      port: {secondary_port}
 access:
   allowed_cidrs:
     - 127.0.0.0/8
@@ -126,6 +131,7 @@ routes:
             child,
             _temp: temp,
             base_url: format!("http://127.0.0.1:{port}"),
+            secondary_base_url: format!("http://127.0.0.1:{secondary_port}"),
             client: Client::new(),
             config_path,
             token: TOKEN.to_owned(),
@@ -135,20 +141,30 @@ routes:
     }
 
     async fn wait_ready(&self) {
-        for _ in 0..100 {
-            if self
-                .client
-                .get(format!("{}/healthz", self.base_url))
-                .bearer_auth(&self.token)
-                .send()
-                .await
-                .is_ok_and(|response| response.status() == StatusCode::OK)
-            {
-                return;
+        for base_url in [&self.base_url, &self.secondary_base_url] {
+            for _ in 0..100 {
+                if self
+                    .client
+                    .get(format!("{base_url}/healthz"))
+                    .bearer_auth(&self.token)
+                    .send()
+                    .await
+                    .is_ok_and(|response| response.status() == StatusCode::OK)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(
+                self.client
+                    .get(format!("{base_url}/healthz"))
+                    .bearer_auth(&self.token)
+                    .send()
+                    .await
+                    .is_ok_and(|response| response.status() == StatusCode::OK),
+                "command-api did not become ready on {base_url}"
+            );
         }
-        panic!("command-api did not become ready");
     }
 
     async fn execute(&self, route: &str, args: &[&str]) -> reqwest::Response {
@@ -315,6 +331,21 @@ async fn executes_arguments_captures_streams_merges_and_times_out() {
 
     let unauthorized = server.client.get(format!("{}/", server.base_url)).send().await.unwrap();
     assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    let response = server
+        .client
+        .post(format!("{}/run", server.secondary_base_url))
+        .bearer_auth(&server.token)
+        .json(&json!({ "args": ["secondary", "listener"] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let accepted: Value = response.json().await.unwrap();
+    assert_eq!(
+        server.wait_finished(accepted["task_id"].as_str().unwrap()).await["status"],
+        "succeeded"
+    );
 
     let response = server.execute("/run", &["hello world", "tail"]).await;
     assert_eq!(response.status(), StatusCode::ACCEPTED);
@@ -515,6 +546,15 @@ fn free_port() -> u16 {
         .local_addr()
         .unwrap()
         .port()
+}
+
+fn distinct_free_port(excluded: u16) -> u16 {
+    loop {
+        let port = free_port();
+        if port != excluded {
+            return port;
+        }
+    }
 }
 
 fn yaml_path(path: &Path) -> String {

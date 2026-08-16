@@ -1,6 +1,6 @@
 [package]
 name = "command-api"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 description = "通过受控 HTTP API 异步执行预配置脚本"
 repository = "https://github.com/loveyu/command-api"

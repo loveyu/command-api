@@ -1,11 +1,11 @@
 use anyhow::{Context, Result, bail};
 use ipnet::IpNet;
 use regex::Regex;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::{
     collections::{BTreeMap, HashSet},
     fs,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    net::{IpAddr, Ipv4Addr},
     path::{Path, PathBuf},
 };
 use zeroize::Zeroizing;
@@ -31,10 +31,36 @@ pub struct Config {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
-    #[serde(default = "default_host")]
+    #[serde(default, alias = "host", deserialize_with = "deserialize_optional_hosts")]
+    pub hosts: Option<Vec<IpAddr>>,
+    #[serde(default)]
+    pub port: Option<u16>,
+    #[serde(default)]
+    pub listeners: Vec<ListenerConfig>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Hash)]
+#[serde(deny_unknown_fields)]
+pub struct ListenerConfig {
     pub host: IpAddr,
-    #[serde(default = "default_port")]
     pub port: u16,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum OneOrManyHosts {
+    One(IpAddr),
+    Many(Vec<IpAddr>),
+}
+
+fn deserialize_optional_hosts<'de, D>(deserializer: D) -> Result<Option<Vec<IpAddr>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(Some(match OneOrManyHosts::deserialize(deserializer)? {
+        OneOrManyHosts::One(host) => vec![host],
+        OneOrManyHosts::Many(hosts) => hosts,
+    }))
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -283,7 +309,7 @@ impl OutputEncoding {
 #[derive(Debug, Clone)]
 pub struct ResolvedConfig {
     pub source_path: PathBuf,
-    pub server: ServerConfig,
+    pub server: ResolvedServerConfig,
     pub access: AccessConfig,
     pub tls: Option<ResolvedTlsConfig>,
     pub auth: ResolvedAuthConfig,
@@ -292,6 +318,11 @@ pub struct ResolvedConfig {
     #[cfg_attr(not(windows), allow(dead_code))]
     pub windows_service: WindowsServiceConfig,
     pub routes: Vec<ResolvedRoute>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedServerConfig {
+    pub listeners: Vec<ListenerConfig>,
 }
 
 #[derive(Debug, Clone)]
@@ -345,7 +376,7 @@ impl Config {
     }
 
     fn resolve(self, source_path: PathBuf) -> Result<ResolvedConfig> {
-        validate_bind_address(self.server.host)?;
+        let server = resolve_server(self.server)?;
         validate_access(&self.access)?;
         if self.execution.max_total_concurrency == 0 {
             bail!("execution.max_total_concurrency 必须大于 0");
@@ -368,7 +399,7 @@ impl Config {
         let auth = ResolvedAuthConfig {
             token: Zeroizing::new(resolve_token(base, self.auth.token)?),
         };
-        let tls = resolve_tls(base, self.tls, self.server.host)?;
+        let tls = resolve_tls(base, self.tls)?;
         let log_directory = absolute_from(base, &self.logging.directory);
         fs::create_dir_all(log_directory.join("tasks"))
             .with_context(|| format!("无法创建日志目录 {}", log_directory.display()))?;
@@ -447,7 +478,7 @@ impl Config {
 
         Ok(ResolvedConfig {
             source_path,
-            server: self.server,
+            server,
             access: self.access,
             tls,
             auth,
@@ -460,6 +491,21 @@ impl Config {
             routes,
         })
     }
+}
+
+fn resolve_server(server: ServerConfig) -> Result<ResolvedServerConfig> {
+    let listeners = if server.listeners.is_empty() {
+        let hosts = server.hosts.unwrap_or_else(default_hosts);
+        let port = server.port.unwrap_or_else(default_port);
+        hosts.into_iter().map(|host| ListenerConfig { host, port }).collect()
+    } else {
+        if server.hosts.is_some() || server.port.is_some() {
+            bail!("server.listeners 不能与 server.host/server.hosts/server.port 同时配置");
+        }
+        server.listeners
+    };
+    validate_listeners(&listeners)?;
+    Ok(ResolvedServerConfig { listeners })
 }
 
 fn validate_route(route: &RouteConfig) -> Result<()> {
@@ -576,11 +622,8 @@ fn resolve_token(base: &Path, source: TokenSource) -> Result<String> {
     Ok(token)
 }
 
-fn resolve_tls(base: &Path, tls: Option<TlsConfig>, host: IpAddr) -> Result<Option<ResolvedTlsConfig>> {
+fn resolve_tls(base: &Path, tls: Option<TlsConfig>) -> Result<Option<ResolvedTlsConfig>> {
     let Some(tls) = tls else {
-        if !host.is_loopback() {
-            bail!("非 loopback 内网监听必须配置 TLS/mTLS");
-        }
         return Ok(None);
     };
     Ok(Some(ResolvedTlsConfig {
@@ -599,9 +642,15 @@ fn canonical_file(base: &Path, value: &Path, label: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
-fn validate_bind_address(host: IpAddr) -> Result<()> {
-    if !is_private_or_local_ip(host) {
-        bail!("server.host 必须是明确的私有、loopback 或 link-local IP，禁止公网和全地址监听: {host}");
+fn validate_listeners(listeners: &[ListenerConfig]) -> Result<()> {
+    if listeners.is_empty() {
+        bail!("server 至少需要一个监听端点");
+    }
+    let mut unique = HashSet::with_capacity(listeners.len());
+    for listener in listeners {
+        if !unique.insert(*listener) {
+            bail!("server 包含重复监听端点: {}:{}", listener.host, listener.port);
+        }
     }
     Ok(())
 }
@@ -609,11 +658,6 @@ fn validate_bind_address(host: IpAddr) -> Result<()> {
 fn validate_access(access: &AccessConfig) -> Result<()> {
     if access.allowed_cidrs.is_empty() {
         bail!("access.allowed_cidrs 至少需要一个 CIDR");
-    }
-    for cidr in &access.allowed_cidrs {
-        if !is_private_or_local_net(*cidr) {
-            bail!("access.allowed_cidrs 仅允许私有、loopback 或 link-local 网段: {cidr}");
-        }
     }
     if access.token_failure_cooldown.enabled
         && (access.token_failure_cooldown.seconds == 0 || access.token_failure_cooldown.max_tracked_ips == 0)
@@ -628,39 +672,6 @@ pub fn normalize_ip(ip: IpAddr) -> IpAddr {
         IpAddr::V6(ipv6) => ipv6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(IpAddr::V6(ipv6)),
         value => value,
     }
-}
-
-fn is_private_or_local_ip(ip: IpAddr) -> bool {
-    match normalize_ip(ip) {
-        IpAddr::V4(ip) => ip.is_private() || ip.is_loopback() || ip.is_link_local(),
-        IpAddr::V6(ip) => ip.is_loopback() || is_ipv6_unique_local(ip) || is_ipv6_link_local(ip),
-    }
-}
-
-fn is_private_or_local_net(net: IpNet) -> bool {
-    const PRIVATE_NETS: [&str; 8] = [
-        "10.0.0.0/8",
-        "172.16.0.0/12",
-        "192.168.0.0/16",
-        "127.0.0.0/8",
-        "169.254.0.0/16",
-        "::1/128",
-        "fc00::/7",
-        "fe80::/10",
-    ];
-    PRIVATE_NETS
-        .iter()
-        .filter_map(|value| value.parse::<IpNet>().ok())
-        .any(|parent| parent.contains(&net))
-}
-
-fn is_ipv6_unique_local(ip: Ipv6Addr) -> bool {
-    ip.octets()[0] & 0xfe == 0xfc
-}
-
-fn is_ipv6_link_local(ip: Ipv6Addr) -> bool {
-    let octets = ip.octets();
-    octets[0] == 0xfe && octets[1] & 0xc0 == 0x80
 }
 
 fn absolute_from(base: &Path, value: &Path) -> PathBuf {
@@ -679,8 +690,8 @@ fn absolute_if_path_like(base: &Path, value: PathBuf) -> PathBuf {
     }
 }
 
-const fn default_host() -> IpAddr {
-    IpAddr::V4(Ipv4Addr::LOCALHOST)
+fn default_hosts() -> Vec<IpAddr> {
+    vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]
 }
 
 const fn default_port() -> u16 {
@@ -779,15 +790,47 @@ mod tests {
     }
 
     #[test]
-    fn only_private_or_local_networks_are_accepted() {
-        assert!(validate_bind_address("10.132.1.145".parse().unwrap()).is_ok());
-        assert!(validate_bind_address("127.0.0.1".parse().unwrap()).is_ok());
-        assert!(validate_bind_address("0.0.0.0".parse().unwrap()).is_err());
-        assert!(validate_bind_address("8.8.8.8".parse().unwrap()).is_err());
-        assert!(is_private_or_local_net("10.132.1.1/32".parse().unwrap()));
-        assert!(is_private_or_local_net("fc00::/16".parse().unwrap()));
-        assert!(!is_private_or_local_net("0.0.0.0/0".parse().unwrap()));
-        assert!(!is_private_or_local_net("2001:db8::/32".parse().unwrap()));
+    fn accepts_legacy_host_and_multiple_freely_configured_hosts() {
+        let legacy: ServerConfig = serde_yaml::from_str("host: 127.0.0.1\nport: 27415\n").unwrap();
+        assert_eq!(legacy.hosts, Some(vec!["127.0.0.1".parse::<IpAddr>().unwrap()]));
+        assert_eq!(resolve_server(legacy).unwrap().listeners.len(), 1);
+
+        let multiple: ServerConfig =
+            serde_yaml::from_str("hosts: [127.0.0.1, 0.0.0.0, 2001:db8::1]\nport: 27415\n").unwrap();
+        assert_eq!(resolve_server(multiple).unwrap().listeners.len(), 3);
+    }
+
+    #[test]
+    fn supports_independent_ports_and_rejects_conflicting_server_forms() {
+        let endpoints: ServerConfig = serde_yaml::from_str(
+            "listeners:\n  - { host: 127.0.0.1, port: 27415 }\n  - { host: 127.0.0.1, port: 27416 }\n",
+        )
+        .unwrap();
+        let listeners = resolve_server(endpoints).unwrap().listeners;
+        assert_eq!(listeners.len(), 2);
+        assert_ne!(listeners[0].port, listeners[1].port);
+
+        let conflicting: ServerConfig =
+            serde_yaml::from_str("host: 127.0.0.1\nlisteners:\n  - { host: 127.0.0.1, port: 27415 }\n").unwrap();
+        assert!(resolve_server(conflicting).is_err());
+
+        let duplicate = ListenerConfig {
+            host: "127.0.0.1".parse().unwrap(),
+            port: 27415,
+        };
+        assert!(validate_listeners(&[]).is_err());
+        assert!(validate_listeners(&[duplicate, duplicate]).is_err());
+    }
+
+    #[test]
+    fn allows_any_valid_cidr_but_still_requires_one() {
+        let mut access = AccessConfig {
+            allowed_cidrs: vec!["0.0.0.0/0".parse().unwrap(), "2001:db8::/32".parse().unwrap()],
+            token_failure_cooldown: TokenFailureCooldownConfig::default(),
+        };
+        assert!(validate_access(&access).is_ok());
+        access.allowed_cidrs.clear();
+        assert!(validate_access(&access).is_err());
     }
 
     #[test]

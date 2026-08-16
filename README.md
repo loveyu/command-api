@@ -2,7 +2,7 @@
 
 `command-api` 将配置文件中预先声明的脚本暴露为带 Token 鉴权的异步 HTTP API。它只执行配置允许的脚本，支持逐路由和全局并发限制、动态 argv 参数、执行超时、平滑/强制终止进程树、输出持久化、任务状态查询以及服务停止和运行时重启。
 
-> **安全边界**：本服务只适用于受控内网，禁止直接或通过 NAT 端口转发、反向代理暴露到公网。程序拒绝公网 IP、`0.0.0.0`、`::` 监听以及公网 CIDR；非 loopback 监听强制启用 mTLS。
+> **安全边界**：本服务只适用于受控内网，不适合直接或通过 NAT 端口转发、反向代理暴露到公网。程序允许自由配置监听 IP、CIDR 和明文 HTTP，因此网络边界必须由部署者通过精确 CIDR、mTLS 和系统防火墙共同保护。
 
 项目地址：<https://github.com/loveyu/command-api>
 
@@ -29,8 +29,11 @@ cp config.example.yaml config.yaml
 
 ```yaml
 server:
-  host: 10.132.1.145
-  port: 27415
+  listeners:
+    - host: 10.132.1.145
+      port: 27415
+    - host: 127.0.0.1
+      port: 27416
 
 access:
   allowed_cidrs:
@@ -40,10 +43,10 @@ access:
     seconds: 10
     max_tracked_ips: 4096
 
-tls:
-  certificate: ./tls/server.crt
-  private_key: ./tls/server.key
-  client_ca_certificate: ./tls/client-ca.crt
+# tls:
+#   certificate: ./tls/server.crt
+#   private_key: ./tls/server.key
+#   client_ca_certificate: ./tls/client-ca.crt
 
 auth:
   token:
@@ -78,7 +81,11 @@ routes:
     output_encoding: utf-8
 ```
 
-相对的脚本、工作目录、日志、证书和 DPAPI 密钥路径均相对于配置文件所在目录解析。配置会在启动时校验；明文 Token、空 CIDR、公网监听/网段、非 loopback 未配置 mTLS、脚本不存在、路由冲突、限制为零或 `cmd` 启用动态参数时都会拒绝启动。配置修改后可以调用运行时重启接口重新加载；`logging.directory` 是例外，修改它需要先停止服务，再通过命令行或外部服务管理器启动。
+`server.listeners` 可以配置一个或多个 IPv4/IPv6 地址与端口组合；所有监听端点共享同一套路由、Token、CIDR、并发限制、任务存储和 TLS 策略。旧版 `server.host + server.port` 单地址写法，以及 `server.hosts + server.port` 多地址共用端口写法继续兼容，但不能与 `listeners` 同时出现。地址和 CIDR 可以自由配置，包括全地址和公网地址；这不代表适合公网部署。
+
+未配置 `tls` 时所有监听端点均使用明文 HTTP；配置 `tls` 后所有端点统一启用 TLS，并强制客户端证书认证（mTLS），服务器证书需要覆盖客户端实际访问的全部地址或名称。明文模式或非回环监听不会阻止启动，但会向日志写入安全警告；前台模式下警告也会显示在控制台。
+
+相对的脚本、工作目录、日志、证书和 DPAPI 密钥路径均相对于配置文件所在目录解析。配置会在启动时校验；明文 Token、空 CIDR、空或重复监听端点、混用新旧监听格式、脚本不存在、路由冲突、限制为零或 `cmd` 启用动态参数时都会拒绝启动。配置修改后可以调用运行时重启接口重新加载；`logging.directory` 是例外，修改它需要先停止服务，再通过命令行或外部服务管理器启动。
 
 `allowed_values` 和 `allowed_patterns` 对每个请求参数执行允许值/正则校验；两者同时配置时，参数满足任一规则即可。LocalSystem 服务的路由只要启用动态参数，就必须至少配置其中一种规则。
 
@@ -153,9 +160,11 @@ command-api.exe run --config C:\command-api\config.yaml
 Authorization: Bearer <token>
 ```
 
-Token 不支持通过 URL 查询参数传递，以免出现在日志和浏览器历史中。该 Token 同时拥有脚本执行、任务强制终止和服务启停权限，应按管理密钥保护，并同时使用 mTLS、应用层 CIDR 和系统防火墙限制调用来源。
+Token 不支持通过 URL 查询参数传递，以免出现在日志和浏览器历史中。该 Token 同时拥有脚本执行、任务强制终止和服务启停权限，应按管理密钥保护。非回环监听强烈建议同时启用 mTLS、精确的应用层 CIDR 和系统防火墙；明文模式只应在可信、隔离的内网使用。
 
 ### 创建任务
+
+以下接口示例按已经启用 mTLS 编写；明文模式应改用 `http://`，并移除 `--cacert`、`--cert` 和 `--key` 参数。
 
 ```bash
 curl -sS -X POST https://10.132.1.145:27415/commands/example-shell \

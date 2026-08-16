@@ -7,7 +7,10 @@ use crate::{
 use anyhow::{Context, Result, bail};
 use rustls::{RootCertStore, ServerConfig as RustlsServerConfig, server::WebPkiClientVerifier};
 use std::{fs::File, future::Future, io::BufReader, net::SocketAddr, path::Path, pin::Pin, sync::Arc, time::Duration};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::{
+    sync::{mpsc, oneshot, watch},
+    task::JoinSet,
+};
 use tracing_subscriber::{EnvFilter, fmt::writer::MakeWriterExt, layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Debug)]
@@ -43,24 +46,50 @@ pub async fn run(
         .await?;
         let cleanup_task = store.spawn_cleanup();
 
-        let address = SocketAddr::new(config.server.host, config.server.port);
-        tracing::info!(%address, config = %config.source_path.display(), "command-api 已启动");
-
         let (management_tx, mut management_rx) = mpsc::channel(1);
         let application = app::build(&config, store.clone(), management_tx);
-        let service = application.into_make_service_with_connect_info::<SocketAddr>();
         let handle = axum_server::Handle::new();
-        let server: Pin<Box<dyn Future<Output = std::io::Result<()>> + Send>> = match &config.tls {
-            Some(tls) => {
-                let tls = load_tls_config(tls)?;
-                Box::pin(
-                    axum_server::bind_rustls(address, tls)
-                        .handle(handle.clone())
-                        .serve(service),
-                )
+        let tls = config.tls.as_ref().map(load_tls_config).transpose()?;
+        let mut servers = JoinSet::new();
+        if config.tls.is_none() {
+            tracing::warn!("未配置 TLS，所有监听端点均使用明文 HTTP；仅应在可信、隔离的网络中使用");
+        }
+        if config
+            .server
+            .listeners
+            .iter()
+            .any(|listener| !listener.host.is_loopback())
+        {
+            tracing::warn!("检测到非回环监听端点；command-api 不适合暴露到公网，请使用精确 CIDR 和防火墙保护");
+        }
+        for listener in &config.server.listeners {
+            let address = SocketAddr::new(listener.host, listener.port);
+            let service = application.clone().into_make_service_with_connect_info::<SocketAddr>();
+            let listener_handle = handle.clone();
+            let listener_tls = tls.clone();
+            tracing::info!(%address, config = %config.source_path.display(), "command-api 正在监听");
+            servers.spawn(async move {
+                match listener_tls {
+                    Some(tls) => {
+                        axum_server::bind_rustls(address, tls)
+                            .handle(listener_handle)
+                            .serve(service)
+                            .await
+                    }
+                    None => axum_server::bind(address).handle(listener_handle).serve(service).await,
+                }
+            });
+        }
+        let server: Pin<Box<dyn Future<Output = std::io::Result<()>> + Send>> = Box::pin(async move {
+            while let Some(result) = servers.join_next().await {
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => return Err(error),
+                    Err(error) => return Err(std::io::Error::other(format!("HTTP 监听任务异常退出: {error}"))),
+                }
             }
-            None => Box::pin(axum_server::bind(address).handle(handle.clone()).serve(service)),
-        };
+            Ok(())
+        });
         let mut external_shutdown_rx = external_shutdown_rx.clone();
         let (action_tx, action_rx) = oneshot::channel();
         tokio::spawn(async move {
