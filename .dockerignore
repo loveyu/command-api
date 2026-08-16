@@ -1,0 +1,7 @@
+.git
+target/*
+!target/release/
+target/release/*
+!target/release/command-api
+config.yaml
+logs
