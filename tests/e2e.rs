@@ -3,7 +3,7 @@ use serde_json::{Value, json};
 use std::{
     fs,
     net::TcpListener,
-    path::Path,
+    path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     time::Duration,
 };
@@ -14,6 +14,8 @@ struct Server {
     _temp: TempDir,
     base_url: String,
     client: Client,
+    config_path: PathBuf,
+    token: String,
 }
 
 impl Drop for Server {
@@ -97,6 +99,8 @@ routes:
             _temp: temp,
             base_url: format!("http://127.0.0.1:{port}"),
             client: Client::new(),
+            config_path,
+            token: "integration-secret".to_owned(),
         };
         server.wait_ready().await;
         server
@@ -107,7 +111,7 @@ routes:
             if self
                 .client
                 .get(format!("{}/healthz", self.base_url))
-                .bearer_auth("integration-secret")
+                .bearer_auth(&self.token)
                 .send()
                 .await
                 .is_ok_and(|response| response.status() == StatusCode::OK)
@@ -122,7 +126,7 @@ routes:
     async fn execute(&self, route: &str, args: &[&str]) -> reqwest::Response {
         self.client
             .post(format!("{}{route}", self.base_url))
-            .bearer_auth("integration-secret")
+            .bearer_auth(&self.token)
             .json(&json!({ "args": args }))
             .send()
             .await
@@ -131,19 +135,23 @@ routes:
 
     async fn wait_finished(&self, id: &str) -> Value {
         for _ in 0..200 {
-            let value: Value = self
+            let response = self
                 .client
                 .get(format!("{}/tasks/{id}", self.base_url))
-                .bearer_auth("integration-secret")
+                .bearer_auth(&self.token)
                 .send()
-                .await
-                .unwrap()
-                .json()
-                .await
-                .unwrap();
+                .await;
+            let Ok(response) = response else {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            };
+            let Ok(value) = response.json::<Value>().await else {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            };
             if matches!(
                 value["status"].as_str(),
-                Some("succeeded" | "failed" | "timed_out" | "cancelled" | "interrupted")
+                Some("succeeded" | "failed" | "timed_out" | "cancelled" | "killed" | "interrupted")
             ) {
                 return value;
             }
@@ -155,13 +163,23 @@ routes:
     async fn output(&self, id: &str, stream: &str) -> Value {
         self.client
             .get(format!("{}/tasks/{id}/output?stream={stream}", self.base_url))
-            .bearer_auth("integration-secret")
+            .bearer_auth(&self.token)
             .send()
             .await
             .unwrap()
             .json()
             .await
             .unwrap()
+    }
+
+    async fn wait_process_exit(&mut self) {
+        for _ in 0..200 {
+            if self.child.try_wait().unwrap().is_some() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("command-api did not stop");
     }
 }
 
@@ -218,10 +236,89 @@ async fn executes_arguments_captures_streams_merges_and_times_out() {
 
     let response = server.execute("/timeout", &["sleep", "30"]).await;
     let accepted: Value = response.json().await.unwrap();
+    let kill_id = accepted["task_id"].as_str().unwrap();
+    let kill = server
+        .client
+        .post(format!("{}/tasks/{kill_id}/kill", server.base_url))
+        .bearer_auth("integration-secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(kill.status(), StatusCode::ACCEPTED);
+    let killed = server.wait_finished(kill_id).await;
+    assert_eq!(killed["status"], "killed");
+    assert_eq!(killed["termination"]["reason"], "force_killed");
+    assert_eq!(killed["termination"]["graceful_attempted"], false);
+    assert_eq!(killed["termination"]["forced"], true);
+
+    let response = server.execute("/timeout", &["sleep", "30"]).await;
+    let accepted: Value = response.json().await.unwrap();
     let timeout_id = accepted["task_id"].as_str().unwrap();
     let task = server.wait_finished(timeout_id).await;
     assert_eq!(task["status"], "timed_out");
     assert_eq!(task["termination"]["reason"], "timeout");
+}
+
+#[tokio::test]
+async fn validates_restart_configuration_restarts_and_stops() {
+    let mut server = Server::start().await;
+
+    let unauthorized = server
+        .client
+        .post(format!("{}/system/stop", server.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    let valid_config = fs::read_to_string(&server.config_path).unwrap();
+    fs::write(&server.config_path, "not: [valid").unwrap();
+    let invalid_restart = server
+        .client
+        .post(format!("{}/system/restart", server.base_url))
+        .bearer_auth("integration-secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(invalid_restart.status(), StatusCode::CONFLICT);
+    server.wait_ready().await;
+    let reloaded_config = valid_config.replace("token: integration-secret", "token: integration-secret-reloaded");
+    fs::write(&server.config_path, reloaded_config).unwrap();
+
+    let response = server.execute("/run", &["sleep", "30"]).await;
+    let accepted: Value = response.json().await.unwrap();
+    let interrupted_id = accepted["task_id"].as_str().unwrap();
+    let restart = server
+        .client
+        .post(format!("{}/system/restart", server.base_url))
+        .bearer_auth(&server.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(restart.status(), StatusCode::ACCEPTED);
+    server.token = "integration-secret-reloaded".to_owned();
+
+    let interrupted = server.wait_finished(interrupted_id).await;
+    assert_eq!(interrupted["status"], "interrupted");
+    assert_eq!(interrupted["termination"]["reason"], "server_restart");
+    assert!(server.child.try_wait().unwrap().is_none());
+
+    let response = server.execute("/run", &["after", "restart"]).await;
+    let accepted: Value = response.json().await.unwrap();
+    assert_eq!(
+        server.wait_finished(accepted["task_id"].as_str().unwrap()).await["status"],
+        "succeeded"
+    );
+
+    let stop = server
+        .client
+        .post(format!("{}/system/stop", server.base_url))
+        .bearer_auth(&server.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stop.status(), StatusCode::ACCEPTED);
+    server.wait_process_exit().await;
 }
 
 fn free_port() -> u16 {

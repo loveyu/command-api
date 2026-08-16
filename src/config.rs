@@ -343,7 +343,12 @@ fn validate_route(route: &RouteConfig) -> Result<()> {
     if path.contains(['?', '#']) || path.split('/').any(|segment| segment == "..") {
         bail!("路由路径包含非法内容: {path}");
     }
-    if matches!(path, "/" | "/healthz") || path == "/tasks" || path.starts_with("/tasks/") {
+    if matches!(path, "/" | "/healthz")
+        || path == "/tasks"
+        || path.starts_with("/tasks/")
+        || path == "/system"
+        || path.starts_with("/system/")
+    {
         bail!("路由路径与系统接口冲突: {path}");
     }
     if route.max_concurrency == 0 {

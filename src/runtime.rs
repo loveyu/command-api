@@ -1,48 +1,107 @@
-use crate::{app, config::Config, model::StopReason, store::TaskStore};
-use anyhow::{Context, Result};
+use crate::{
+    app,
+    config::{Config, ResolvedConfig},
+    model::StopReason,
+    store::TaskStore,
+};
+use anyhow::{Context, Result, bail};
 use std::{future::Future, path::Path, time::Duration};
+use tokio::sync::{mpsc, oneshot, watch};
 use tracing_subscriber::{EnvFilter, fmt::writer::MakeWriterExt, layer::SubscriberExt, util::SubscriberInitExt};
+
+#[derive(Debug)]
+pub enum ManagementAction {
+    Stop,
+    Restart(Box<ResolvedConfig>),
+}
 
 pub async fn run(
     config_path: &Path,
     shutdown: impl Future<Output = ()> + Send + 'static,
     log_to_console: bool,
 ) -> Result<()> {
-    let config = Config::load(config_path)?;
+    let mut config = Config::load(config_path)?;
+    let logging_directory = config.logging.directory.clone();
     let _log_guard = init_logging(&config.logging.directory, log_to_console)?;
-    let store = TaskStore::open(
-        config.logging.directory.clone(),
-        config.logging.retention_seconds,
-        config.logging.max_output_bytes_per_task,
-    )
-    .await?;
-    store.spawn_cleanup();
+    let (external_shutdown_tx, external_shutdown_rx) = watch::channel(false);
+    tokio::spawn(async move {
+        shutdown.await;
+        external_shutdown_tx.send_replace(true);
+    });
 
-    let address = listen_address(&config.server.host, config.server.port);
-    let listener = tokio::net::TcpListener::bind(&address)
-        .await
-        .with_context(|| format!("无法监听 {address}"))?;
-    tracing::info!(%address, config = %config.source_path.display(), "command-api 已启动");
+    loop {
+        if config.logging.directory != logging_directory {
+            bail!("运行时重启不允许修改 logging.directory；请停止服务后再启动");
+        }
+        let store = TaskStore::open(
+            config.logging.directory.clone(),
+            config.logging.retention_seconds,
+            config.logging.max_output_bytes_per_task,
+        )
+        .await?;
+        let cleanup_task = store.spawn_cleanup();
 
-    let application = app::build(&config, store.clone());
-    let server_result = axum::serve(listener, application)
-        .with_graceful_shutdown(shutdown)
-        .await;
+        let address = listen_address(&config.server.host, config.server.port);
+        let listener = tokio::net::TcpListener::bind(&address)
+            .await
+            .with_context(|| format!("无法监听 {address}"))?;
+        tracing::info!(%address, config = %config.source_path.display(), "command-api 已启动");
 
-    tracing::info!("服务正在停止，开始终止执行中的任务");
-    store.cancel_all(StopReason::ServerShutdown).await;
-    let idle = store
-        .wait_until_idle(Duration::from_secs(config.execution.shutdown_timeout_seconds))
-        .await;
-    if !idle {
-        tracing::warn!(
-            timeout_seconds = config.execution.shutdown_timeout_seconds,
-            "等待任务退出超时；进程退出时平台进程树保护将强制清理遗留任务"
-        );
+        let (management_tx, mut management_rx) = mpsc::channel(1);
+        let application = app::build(&config, store.clone(), management_tx);
+        let mut external_shutdown_rx = external_shutdown_rx.clone();
+        let (action_tx, action_rx) = oneshot::channel();
+        let server_result = axum::serve(listener, application)
+            .with_graceful_shutdown(async move {
+                let action = if *external_shutdown_rx.borrow() {
+                    ManagementAction::Stop
+                } else {
+                    tokio::select! {
+                        _ = external_shutdown_rx.changed() => ManagementAction::Stop,
+                        action = management_rx.recv() => action.unwrap_or(ManagementAction::Stop),
+                    }
+                };
+                let _ = action_tx.send(action);
+            })
+            .await;
+        let action = action_rx.await.unwrap_or(ManagementAction::Stop);
+        let stop_reason = if matches!(&action, ManagementAction::Restart(_)) {
+            StopReason::ServerRestart
+        } else {
+            StopReason::ServerShutdown
+        };
+
+        tracing::info!(reason = %stop_reason, "服务正在停止，开始终止执行中的任务");
+        store.cancel_all(stop_reason).await;
+        let idle = store
+            .wait_until_idle(Duration::from_secs(config.execution.shutdown_timeout_seconds))
+            .await;
+        if !idle {
+            tracing::warn!(
+                timeout_seconds = config.execution.shutdown_timeout_seconds,
+                "等待任务退出超时，立即强制终止遗留任务进程树"
+            );
+            store.cancel_all(StopReason::ForceKilled).await;
+            if !store.wait_until_idle(Duration::from_secs(5)).await {
+                bail!("强制终止任务后仍无法释放运行资源");
+            }
+        }
+        cleanup_task.abort();
+        let _ = cleanup_task.await;
+        server_result.context("HTTP 服务异常退出")?;
+        drop(store);
+
+        match action {
+            ManagementAction::Stop => {
+                tracing::info!("command-api 已停止");
+                return Ok(());
+            }
+            ManagementAction::Restart(next_config) => {
+                tracing::info!("command-api 正在使用重新加载的配置启动");
+                config = *next_config;
+            }
+        }
     }
-    server_result.context("HTTP 服务异常退出")?;
-    tracing::info!("command-api 已停止");
-    Ok(())
 }
 
 pub async fn console_shutdown_signal() {

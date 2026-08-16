@@ -23,7 +23,7 @@ use std::{
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::{
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
-    sync::{Mutex, Notify, RwLock, watch},
+    sync::{Notify, RwLock, watch},
 };
 use uuid::Uuid;
 
@@ -46,7 +46,7 @@ pub struct TaskRecord {
     pub combined_bytes: AtomicU64,
     pub captured_bytes: AtomicU64,
     pub output_truncated: AtomicBool,
-    cancel: Mutex<Option<watch::Sender<Option<StopReason>>>>,
+    stop: watch::Sender<Option<StopReason>>,
 }
 
 impl TaskStore {
@@ -131,24 +131,22 @@ impl TaskStore {
         Some(record.view().await)
     }
 
-    pub async fn cancel(&self, id: Uuid, reason: StopReason) -> Result<bool> {
+    pub async fn request_stop(&self, id: Uuid, reason: StopReason) -> Result<bool> {
         let Some(record) = self.get(id).await else {
             return Ok(false);
         };
-        let sender = record.cancel.lock().await;
-        let Some(sender) = sender.as_ref() else {
+        if record.snapshot().await.status.is_finished() {
             return Ok(false);
-        };
-        sender.send(Some(reason)).context("无法通知任务停止")?;
+        }
+        record.stop.send_replace(Some(reason));
         Ok(true)
     }
 
     pub async fn cancel_all(&self, reason: StopReason) {
         let records: Vec<_> = self.tasks.read().await.values().cloned().collect();
         for record in records {
-            let sender = record.cancel.lock().await;
-            if let Some(sender) = sender.as_ref() {
-                let _ = sender.send(Some(reason));
+            if !record.snapshot().await.status.is_finished() {
+                record.stop.send_replace(Some(reason));
             }
         }
     }
@@ -218,7 +216,7 @@ impl TaskStore {
         })
     }
 
-    pub fn spawn_cleanup(self: &Arc<Self>) {
+    pub fn spawn_cleanup(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
         let store = Arc::clone(self);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(60));
@@ -228,7 +226,7 @@ impl TaskStore {
                     tracing::error!(%error, "清理过期任务失败");
                 }
             }
-        });
+        })
     }
 
     async fn recover(&self) -> Result<()> {
@@ -290,6 +288,7 @@ impl TaskStore {
 
 impl TaskRecord {
     fn new(snapshot: TaskSnapshot, directory: PathBuf) -> Self {
+        let (stop, _) = watch::channel(None);
         Self {
             id: snapshot.task_id,
             directory,
@@ -299,7 +298,7 @@ impl TaskRecord {
             combined_bytes: AtomicU64::new(0),
             captured_bytes: AtomicU64::new(0),
             output_truncated: AtomicBool::new(false),
-            cancel: Mutex::new(None),
+            stop,
         }
     }
 
@@ -309,12 +308,12 @@ impl TaskRecord {
         snapshot
     }
 
-    pub async fn set_cancel_sender(&self, sender: watch::Sender<Option<StopReason>>) {
-        *self.cancel.lock().await = Some(sender);
+    pub fn subscribe_stop(&self) -> watch::Receiver<Option<StopReason>> {
+        self.stop.subscribe()
     }
 
-    pub async fn clear_cancel_sender(&self) {
-        *self.cancel.lock().await = None;
+    pub fn request_stop_now(&self, reason: StopReason) {
+        self.stop.send_replace(Some(reason));
     }
 
     pub async fn transition(&self, update: impl FnOnce(&mut TaskSnapshot)) -> Result<()> {
@@ -360,6 +359,7 @@ impl TaskRecord {
                 stderr: Some(format!("{base}/output?stream=stderr")),
                 combined: None,
                 cancel: format!("{base}/cancel"),
+                kill: format!("{base}/kill"),
             },
             OutputMode::Combined => TaskLinks {
                 status: base.clone(),
@@ -367,6 +367,7 @@ impl TaskRecord {
                 stderr: None,
                 combined: Some(format!("{base}/output?stream=combined")),
                 cancel: format!("{base}/cancel"),
+                kill: format!("{base}/kill"),
             },
         };
         TaskView {

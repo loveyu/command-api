@@ -1,10 +1,11 @@
 use crate::{
-    config::{ResolvedConfig, ResolvedRoute, validate_request_args},
+    config::{Config, ResolvedConfig, ResolvedRoute, validate_request_args},
     model::{
         AcceptedTask, ApiError, BasicResponse, ExecuteRequest, IndexData, MessageData, OutputQuery, StopReason,
         TaskStatus,
     },
     process::{ExecutionPermits, start_task},
+    runtime::ManagementAction,
     store::TaskStore,
 };
 use axum::{
@@ -17,9 +18,16 @@ use axum::{
     routing::{get, post},
 };
 use sha2::{Digest, Sha256};
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicU8, Ordering},
+    },
+};
 use subtle::ConstantTimeEq;
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, mpsc};
 use tower_http::{limit::RequestBodyLimitLayer, trace::TraceLayer};
 use uuid::Uuid;
 
@@ -27,6 +35,10 @@ pub struct AppState {
     token_hash: [u8; 32],
     global_limit: Arc<Semaphore>,
     routes: HashMap<String, Arc<RouteRuntime>>,
+    management_tx: mpsc::Sender<ManagementAction>,
+    lifecycle_state: AtomicU8,
+    config_path: PathBuf,
+    logging_directory: PathBuf,
     pub store: Arc<TaskStore>,
 }
 
@@ -35,7 +47,7 @@ pub struct RouteRuntime {
     limit: Arc<Semaphore>,
 }
 
-pub fn build(config: &ResolvedConfig, store: Arc<TaskStore>) -> Router {
+pub fn build(config: &ResolvedConfig, store: Arc<TaskStore>, management_tx: mpsc::Sender<ManagementAction>) -> Router {
     let routes: HashMap<_, _> = config
         .routes
         .iter()
@@ -57,6 +69,10 @@ pub fn build(config: &ResolvedConfig, store: Arc<TaskStore>) -> Router {
         token_hash,
         global_limit: Arc::new(Semaphore::new(config.execution.max_total_concurrency)),
         routes,
+        management_tx,
+        lifecycle_state: AtomicU8::new(0),
+        config_path: config.source_path.clone(),
+        logging_directory: config.logging.directory.clone(),
         store,
     });
 
@@ -65,7 +81,10 @@ pub fn build(config: &ResolvedConfig, store: Arc<TaskStore>) -> Router {
         .route("/healthz", get(healthz))
         .route("/tasks/{task_id}", get(get_task))
         .route("/tasks/{task_id}/output", get(get_output))
-        .route("/tasks/{task_id}/cancel", post(cancel_task));
+        .route("/tasks/{task_id}/cancel", post(cancel_task))
+        .route("/tasks/{task_id}/kill", post(kill_task))
+        .route("/system/stop", post(stop_service))
+        .route("/system/restart", post(restart_service));
     for route in state.routes.values() {
         router = router.route(&route.config.path, post(execute).layer(Extension(Arc::clone(route))));
     }
@@ -233,7 +252,7 @@ async fn cancel_task(
     }
     let cancelled = state
         .store
-        .cancel(task_id, StopReason::Cancelled)
+        .request_stop(task_id, StopReason::Cancelled)
         .await
         .map_err(|error| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "cancel_failed", error.to_string()))?;
     if !cancelled {
@@ -252,6 +271,102 @@ async fn cancel_task(
             },
         }),
     ))
+}
+
+async fn kill_task(
+    State(state): State<Arc<AppState>>,
+    Path(task_id): Path<Uuid>,
+) -> Result<impl IntoResponse, ApiError> {
+    if state.store.get(task_id).await.is_none() {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "task_not_found",
+            "任务不存在或已经过期",
+        ));
+    }
+    let killed = state
+        .store
+        .request_stop(task_id, StopReason::ForceKilled)
+        .await
+        .map_err(|error| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "kill_failed", error.to_string()))?;
+    if !killed {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "task_finished",
+            "任务已经结束，无法强制终止",
+        ));
+    }
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(BasicResponse {
+            success: true,
+            data: MessageData {
+                message: "已请求立即强制终止整个任务进程树".to_owned(),
+            },
+        }),
+    ))
+}
+
+async fn stop_service(State(state): State<Arc<AppState>>) -> Result<impl IntoResponse, ApiError> {
+    request_management_action(&state, ManagementAction::Stop)?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(BasicResponse {
+            success: true,
+            data: MessageData {
+                message: "已接受服务停止请求".to_owned(),
+            },
+        }),
+    ))
+}
+
+async fn restart_service(State(state): State<Arc<AppState>>) -> Result<impl IntoResponse, ApiError> {
+    let config = Config::load(&state.config_path).map_err(|error| {
+        ApiError::new(
+            StatusCode::CONFLICT,
+            "restart_config_invalid",
+            format!("重新加载配置失败，服务保持运行: {error:#}"),
+        )
+    })?;
+    if config.logging.directory != state.logging_directory {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "restart_log_directory_changed",
+            "运行时重启不允许修改 logging.directory；请先停止服务，再通过外部管理器启动",
+        ));
+    }
+    request_management_action(&state, ManagementAction::Restart(Box::new(config)))?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(BasicResponse {
+            success: true,
+            data: MessageData {
+                message: "已接受服务重启请求，将使用重新加载的配置恢复服务".to_owned(),
+            },
+        }),
+    ))
+}
+
+fn request_management_action(state: &AppState, action: ManagementAction) -> Result<(), ApiError> {
+    state
+        .lifecycle_state
+        .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::CONFLICT,
+                "service_transition_in_progress",
+                "服务停止或重启操作已经开始",
+            )
+        })?;
+    if state.management_tx.try_send(action).is_err() {
+        state.lifecycle_state.store(0, Ordering::SeqCst);
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "service_control_unavailable",
+            "服务管理通道不可用",
+        ));
+    }
+    Ok(())
 }
 
 async fn fallback() -> ApiError {
@@ -299,7 +414,8 @@ routes:
         )
         .await
         .unwrap();
-        let app = build(&config, store);
+        let (management_tx, _management_rx) = mpsc::channel(1);
+        let app = build(&config, store, management_tx);
 
         let response = app
             .clone()

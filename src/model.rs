@@ -15,6 +15,7 @@ pub enum TaskStatus {
     Failed,
     TimedOut,
     Cancelled,
+    Killed,
     Interrupted,
 }
 
@@ -22,7 +23,7 @@ impl TaskStatus {
     pub fn is_finished(self) -> bool {
         matches!(
             self,
-            Self::Succeeded | Self::Failed | Self::TimedOut | Self::Cancelled | Self::Interrupted
+            Self::Succeeded | Self::Failed | Self::TimedOut | Self::Cancelled | Self::Killed | Self::Interrupted
         )
     }
 }
@@ -39,7 +40,9 @@ pub enum OutputMode {
 pub enum StopReason {
     Timeout,
     Cancelled,
+    ForceKilled,
     ServerShutdown,
+    ServerRestart,
     ParentExited,
     LoggingFailure,
 }
@@ -49,7 +52,9 @@ impl fmt::Display for StopReason {
         formatter.write_str(match self {
             Self::Timeout => "timeout",
             Self::Cancelled => "cancelled",
+            Self::ForceKilled => "force_killed",
             Self::ServerShutdown => "server_shutdown",
+            Self::ServerRestart => "server_restart",
             Self::ParentExited => "parent_exited",
             Self::LoggingFailure => "logging_failure",
         })
@@ -119,6 +124,7 @@ pub struct TaskLinks {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub combined: Option<String>,
     pub cancel: String,
+    pub kill: String,
 }
 
 #[derive(Debug, Default, Deserialize)]

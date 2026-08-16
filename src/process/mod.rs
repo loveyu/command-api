@@ -51,8 +51,9 @@ pub fn start_task(
     request_args: Vec<String>,
     permits: ExecutionPermits,
 ) {
+    let stop_rx = record.subscribe_stop();
     tokio::spawn(async move {
-        if let Err(error) = run_task(&store, &record, &route, request_args, permits).await {
+        if let Err(error) = run_task(&store, &record, &route, request_args, permits, stop_rx).await {
             tracing::error!(task_id = %record.id, %error, "任务执行器异常退出");
             let error_message = format!("任务执行器异常: {error:#}");
             let _ = record
@@ -65,7 +66,6 @@ pub fn start_task(
                 })
                 .await;
         }
-        record.clear_cancel_sender().await;
         store.mark_finished();
     });
 }
@@ -76,6 +76,7 @@ async fn run_task(
     route: &ResolvedRoute,
     request_args: Vec<String>,
     _permits: ExecutionPermits,
+    mut stop_rx: watch::Receiver<Option<StopReason>>,
 ) -> Result<()> {
     let mode = if route.merge_stdout_stderr {
         OutputMode::Combined
@@ -83,10 +84,7 @@ async fn run_task(
         OutputMode::Separate
     };
     let capture = Capture::new(mode)?;
-    let (cancel_tx, mut cancel_rx) = watch::channel(None::<StopReason>);
-    record.set_cancel_sender(cancel_tx.clone()).await;
-
-    let output_tasks = capture.start_readers(record.clone(), store.max_output_bytes(), cancel_tx.clone())?;
+    let output_tasks = capture.start_readers(record.clone(), store.max_output_bytes())?;
 
     let executable = std::env::current_exe().context("无法确定 command-api 可执行文件路径")?;
     let mut command = Command::new(executable);
@@ -131,17 +129,37 @@ async fn run_task(
         tokio::select! {
             result = &mut child_wait => break result.context("等待 Worker 退出失败")?,
             _ = tokio::time::sleep_until(deadline) => {
-                stop_reason = Some(StopReason::Timeout);
-                break stop_process(&tree, &mut control, &mut child_wait, route, StopReason::Timeout, record).await?;
+                let (status, actual_reason) = stop_process(
+                    &tree,
+                    &mut control,
+                    &mut child_wait,
+                    route,
+                    StopReason::Timeout,
+                    record,
+                    &mut stop_rx,
+                )
+                .await?;
+                stop_reason = Some(actual_reason);
+                break status;
             }
-            changed = cancel_rx.changed() => {
+            changed = stop_rx.changed() => {
                 if changed.is_err() {
                     continue;
                 }
-                let reason = *cancel_rx.borrow_and_update();
+                let reason = *stop_rx.borrow_and_update();
                 if let Some(reason) = reason {
-                    stop_reason = Some(reason);
-                    break stop_process(&tree, &mut control, &mut child_wait, route, reason, record).await?;
+                    let (status, actual_reason) = stop_process(
+                        &tree,
+                        &mut control,
+                        &mut child_wait,
+                        route,
+                        reason,
+                        record,
+                        &mut stop_rx,
+                    )
+                    .await?;
+                    stop_reason = Some(actual_reason);
+                    break status;
                 }
             }
         }
@@ -180,7 +198,10 @@ async fn run_task(
     let final_status = match stop_reason {
         Some(StopReason::Timeout) => TaskStatus::TimedOut,
         Some(StopReason::Cancelled) => TaskStatus::Cancelled,
-        Some(StopReason::ServerShutdown | StopReason::ParentExited) => TaskStatus::Interrupted,
+        Some(StopReason::ForceKilled) => TaskStatus::Killed,
+        Some(StopReason::ServerShutdown | StopReason::ServerRestart | StopReason::ParentExited) => {
+            TaskStatus::Interrupted
+        }
         Some(StopReason::LoggingFailure) => TaskStatus::Failed,
         None if exit_status.success() => TaskStatus::Succeeded,
         None => TaskStatus::Failed,
@@ -211,7 +232,13 @@ async fn stop_process(
     route: &ResolvedRoute,
     reason: StopReason,
     record: &TaskRecord,
-) -> Result<std::process::ExitStatus> {
+    stop_rx: &mut watch::Receiver<Option<StopReason>>,
+) -> Result<(std::process::ExitStatus, StopReason)> {
+    if reason == StopReason::ForceKilled {
+        let status = force_stop_process(tree, child_wait, record, reason, false, None).await?;
+        return Ok((status, reason));
+    }
+
     record
         .transition(|snapshot| {
             snapshot.status = TaskStatus::Stopping;
@@ -231,37 +258,89 @@ async fn stop_process(
     tree.graceful()?;
 
     let grace_deadline = Instant::now() + Duration::from_secs(route.graceful_shutdown_seconds);
-    let mut worker_status = match tokio::time::timeout_at(grace_deadline, child_wait.as_mut()).await {
-        Ok(status) => Some(status.context("等待 Worker 平滑退出失败")?),
-        Err(_) => None,
+    let mut force_requested = Box::pin(wait_for_force_kill(stop_rx));
+    let mut worker_status = match tokio::select! {
+        status = tokio::time::timeout_at(grace_deadline, child_wait.as_mut()) => Some(status),
+        () = &mut force_requested => None,
+    } {
+        Some(Ok(status)) => Some(status.context("等待 Worker 平滑退出失败")?),
+        Some(Err(_)) => None,
+        None => {
+            let forced_reason = StopReason::ForceKilled;
+            let status = force_stop_process(tree, child_wait, record, forced_reason, true, None).await?;
+            return Ok((status, forced_reason));
+        }
     };
     let tree_stopped = if worker_status.is_some() {
-        match tokio::time::timeout_at(grace_deadline, tree.wait_empty()).await {
-            Ok(result) => {
+        match tokio::select! {
+            result = tokio::time::timeout_at(grace_deadline, tree.wait_empty()) => Some(result),
+            () = &mut force_requested => None,
+        } {
+            Some(Ok(result)) => {
                 result?;
                 true
             }
-            Err(_) => false,
+            Some(Err(_)) => false,
+            None => {
+                let forced_reason = StopReason::ForceKilled;
+                let status =
+                    force_stop_process(tree, child_wait, record, forced_reason, true, worker_status.take()).await?;
+                return Ok((status, forced_reason));
+            }
         }
     } else {
         false
     };
     if tree_stopped {
-        return Ok(worker_status.expect("worker status checked above"));
+        return Ok((worker_status.expect("worker status checked above"), reason));
     }
 
-    tree.force()?;
+    let status = force_stop_process(tree, child_wait, record, reason, true, worker_status.take()).await?;
+    Ok((status, reason))
+}
+
+async fn wait_for_force_kill(stop_rx: &mut watch::Receiver<Option<StopReason>>) {
+    loop {
+        if *stop_rx.borrow_and_update() == Some(StopReason::ForceKilled) {
+            return;
+        }
+        if stop_rx.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+async fn force_stop_process(
+    tree: &platform::ProcessTree,
+    child_wait: &mut std::pin::Pin<Box<impl std::future::Future<Output = std::io::Result<std::process::ExitStatus>>>>,
+    record: &TaskRecord,
+    reason: StopReason,
+    graceful_attempted: bool,
+    worker_status: Option<std::process::ExitStatus>,
+) -> Result<std::process::ExitStatus> {
     record
         .transition(|snapshot| {
-            if let Some(termination) = snapshot.termination.as_mut() {
-                termination.forced = true;
-                termination.method = platform::force_method().to_owned();
-                termination.signal = platform::force_signal().map(str::to_owned);
-                termination.message = Some("平滑退出宽限期已结束，已强制终止整个进程树".to_owned());
-            }
+            snapshot.status = TaskStatus::Stopping;
+            snapshot.termination = Some(Termination {
+                reason,
+                graceful_attempted,
+                forced: true,
+                method: platform::force_method().to_owned(),
+                signal: platform::force_signal().map(str::to_owned),
+                message: Some(if graceful_attempted {
+                    if reason == StopReason::ForceKilled {
+                        "收到强制终止请求，已立即终止整个进程树".to_owned()
+                    } else {
+                        "平滑退出宽限期已结束，已强制终止整个进程树".to_owned()
+                    }
+                } else {
+                    "已立即强制终止整个进程树，未尝试平滑退出".to_owned()
+                }),
+            });
         })
         .await?;
-    let status = match worker_status.take() {
+    tree.force()?;
+    let status = match worker_status {
         Some(status) => status,
         None => child_wait.as_mut().await.context("等待 Worker 强制退出失败")?,
     };
@@ -307,21 +386,15 @@ impl Capture {
         command.stderr(Stdio::from(self.stderr.take().expect("stderr writer")));
     }
 
-    fn start_readers(
-        &self,
-        record: Arc<TaskRecord>,
-        limit: u64,
-        cancel: watch::Sender<Option<StopReason>>,
-    ) -> Result<Vec<tokio::task::JoinHandle<Result<()>>>> {
+    fn start_readers(&self, record: Arc<TaskRecord>, limit: u64) -> Result<Vec<tokio::task::JoinHandle<Result<()>>>> {
         let mut tasks = Vec::with_capacity(self.readers.len());
         for (stream, reader) in &self.readers {
             let reader = reader.try_clone()?;
             let record = record.clone();
-            let cancel = cancel.clone();
             let stream = *stream;
             tasks.push(tokio::task::spawn_blocking(move || {
                 if let Err(error) = copy_output(reader, &record, stream, limit) {
-                    let _ = cancel.send(Some(StopReason::LoggingFailure));
+                    record.request_stop_now(StopReason::LoggingFailure);
                     return Err(error);
                 }
                 Ok(())
