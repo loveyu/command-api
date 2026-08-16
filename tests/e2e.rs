@@ -278,8 +278,8 @@ routes:
 
     fn client(&self, with_identity: bool) -> Client {
         let mut builder = Client::builder()
-            .add_root_certificate(Certificate::from_pem(&self.ca_pem).unwrap())
-            .tls_backend_rustls();
+            .tls_backend_rustls()
+            .tls_certs_only([Certificate::from_pem(&self.ca_pem).unwrap()]);
         if with_identity {
             builder = builder.identity(Identity::from_pem(&self.client_identity_pem).unwrap());
         }
@@ -288,19 +288,24 @@ routes:
 
     async fn wait_ready(&self) {
         let client = self.client(true);
-        for _ in 0..100 {
-            if client
+        let mut last_error = None;
+        for _ in 0..300 {
+            match client
                 .get(format!("{}/healthz", self.base_url))
                 .bearer_auth(&self.token)
                 .send()
                 .await
-                .is_ok_and(|response| response.status() == StatusCode::OK)
             {
-                return;
+                Ok(response) if response.status() == StatusCode::OK => return,
+                Ok(response) => last_error = Some(format!("HTTP {}", response.status())),
+                Err(error) => last_error = Some(format!("{error:#}")),
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        panic!("mTLS command-api did not become ready");
+        panic!(
+            "mTLS command-api did not become ready; last probe result: {}",
+            last_error.as_deref().unwrap_or("no probe result")
+        );
     }
 }
 
