@@ -230,24 +230,43 @@ async fn stop_process(
     let _ = control.flush().await;
     tree.graceful()?;
 
-    let grace = Duration::from_secs(route.graceful_shutdown_seconds);
-    match tokio::time::timeout(grace, child_wait.as_mut()).await {
-        Ok(status) => Ok(status.context("等待 Worker 平滑退出失败")?),
-        Err(_) => {
-            tree.force()?;
-            record
-                .transition(|snapshot| {
-                    if let Some(termination) = snapshot.termination.as_mut() {
-                        termination.forced = true;
-                        termination.method = platform::force_method().to_owned();
-                        termination.signal = platform::force_signal().map(str::to_owned);
-                        termination.message = Some("平滑退出宽限期已结束，已强制终止整个进程树".to_owned());
-                    }
-                })
-                .await?;
-            child_wait.as_mut().await.context("等待 Worker 强制退出失败")
+    let grace_deadline = Instant::now() + Duration::from_secs(route.graceful_shutdown_seconds);
+    let mut worker_status = match tokio::time::timeout_at(grace_deadline, child_wait.as_mut()).await {
+        Ok(status) => Some(status.context("等待 Worker 平滑退出失败")?),
+        Err(_) => None,
+    };
+    let tree_stopped = if worker_status.is_some() {
+        match tokio::time::timeout_at(grace_deadline, tree.wait_empty()).await {
+            Ok(result) => {
+                result?;
+                true
+            }
+            Err(_) => false,
         }
+    } else {
+        false
+    };
+    if tree_stopped {
+        return Ok(worker_status.expect("worker status checked above"));
     }
+
+    tree.force()?;
+    record
+        .transition(|snapshot| {
+            if let Some(termination) = snapshot.termination.as_mut() {
+                termination.forced = true;
+                termination.method = platform::force_method().to_owned();
+                termination.signal = platform::force_signal().map(str::to_owned);
+                termination.message = Some("平滑退出宽限期已结束，已强制终止整个进程树".to_owned());
+            }
+        })
+        .await?;
+    let status = match worker_status.take() {
+        Some(status) => status,
+        None => child_wait.as_mut().await.context("等待 Worker 强制退出失败")?,
+    };
+    tree.wait_empty().await?;
+    Ok(status)
 }
 
 struct Capture {
