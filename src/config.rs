@@ -149,11 +149,12 @@ pub enum WindowsServiceAccount {
 }
 
 impl WindowsServiceAccount {
-    #[cfg(windows)]
-    pub const fn account_name(self) -> &'static str {
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub const fn account_name(self) -> Option<&'static str> {
         match self {
-            Self::LocalService => "NT AUTHORITY\\LocalService",
-            Self::LocalSystem => "NT AUTHORITY\\LocalSystem",
+            Self::LocalService => Some("NT AUTHORITY\\LocalService"),
+            // CreateServiceW 使用空账户名表示 LocalSystem；传入显示名称会返回 ERROR_INVALID_SERVICE_ACCOUNT。
+            Self::LocalSystem => None,
         }
     }
 }
@@ -794,6 +795,15 @@ mod tests {
         assert_eq!(
             normalize_ip("::ffff:10.132.1.1".parse().unwrap()),
             "10.132.1.1".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn local_system_uses_the_scm_default_account() {
+        assert_eq!(WindowsServiceAccount::LocalSystem.account_name(), None);
+        assert_eq!(
+            WindowsServiceAccount::LocalService.account_name(),
+            Some("NT AUTHORITY\\LocalService")
         );
     }
 
