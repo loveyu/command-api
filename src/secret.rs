@@ -63,7 +63,7 @@ mod dpapi {
     };
 
     pub fn protect(plaintext: &[u8], scope: DpapiScope) -> Result<Vec<u8>> {
-        let mut input = blob(plaintext);
+        let input = blob(plaintext);
         let mut output = empty_blob();
         let flags = CRYPTPROTECT_UI_FORBIDDEN
             | if matches!(scope, DpapiScope::Machine) {
@@ -73,7 +73,7 @@ mod dpapi {
             };
         let success = unsafe {
             CryptProtectData(
-                &mut input,
+                &input,
                 ptr::null(),
                 ptr::null(),
                 ptr::null_mut(),
@@ -89,11 +89,11 @@ mod dpapi {
     }
 
     pub fn unprotect(protected: &[u8]) -> Result<Vec<u8>> {
-        let mut input = blob(protected);
+        let input = blob(protected);
         let mut output = empty_blob();
         let success = unsafe {
             CryptUnprotectData(
-                &mut input,
+                &input,
                 ptr::null_mut(),
                 ptr::null(),
                 ptr::null_mut(),
