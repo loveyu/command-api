@@ -75,7 +75,7 @@ async fn run_task(
     record: &Arc<TaskRecord>,
     route: &ResolvedRoute,
     request_args: Vec<String>,
-    _permits: ExecutionPermits,
+    permits: ExecutionPermits,
     mut stop_rx: watch::Receiver<Option<StopReason>>,
 ) -> Result<()> {
     let mode = if route.merge_stdout_stderr {
@@ -206,6 +206,10 @@ async fn run_task(
         None if exit_status.success() => TaskStatus::Succeeded,
         None => TaskStatus::Failed,
     };
+    // A terminal task must no longer consume either concurrency slot. Release
+    // the permits before publishing the terminal status so clients can safely
+    // submit the next task after observing completion.
+    drop(permits);
     record
         .transition(|snapshot| {
             snapshot.status = final_status;
