@@ -120,7 +120,8 @@ mod implementation {
         Foundation::{CloseHandle, HANDLE, TRUE},
         System::{
             Console::{
-                AllocConsole, CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent, GetConsoleWindow, SetConsoleCtrlHandler,
+                AllocConsole, CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent, GetConsoleProcessList, GetConsoleWindow,
+                SetConsoleCtrlHandler,
             },
             JobObjects::{
                 AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
@@ -240,7 +241,8 @@ mod implementation {
         // can be targeted without affecting the HTTP service or unrelated tasks.
         // SAFETY: console APIs have no pointer arguments here.
         unsafe {
-            if GetConsoleWindow().is_null() {
+            let mut console_process = 0;
+            if GetConsoleProcessList(&mut console_process, 1) == 0 {
                 if AllocConsole() == 0 {
                     return Err(std::io::Error::last_os_error()).context("为 Windows Worker 创建控制台失败");
                 }
