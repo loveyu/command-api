@@ -119,7 +119,7 @@ mod windows {
                 config.source_path.as_os_str().to_owned(),
             ],
             dependencies: vec![],
-            account_name: Some("NT AUTHORITY\\LocalService".into()),
+            account_name: Some(config.windows_service.account.account_name().into()),
             account_password: None,
         };
         let service = manager.create_service(

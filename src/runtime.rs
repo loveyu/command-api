@@ -1,11 +1,12 @@
 use crate::{
     app,
-    config::{Config, ResolvedConfig},
+    config::{Config, ResolvedConfig, ResolvedTlsConfig},
     model::StopReason,
     store::TaskStore,
 };
 use anyhow::{Context, Result, bail};
-use std::{future::Future, path::Path, time::Duration};
+use rustls::{RootCertStore, ServerConfig as RustlsServerConfig, server::WebPkiClientVerifier};
+use std::{fs::File, future::Future, io::BufReader, net::SocketAddr, path::Path, pin::Pin, sync::Arc, time::Duration};
 use tokio::sync::{mpsc, oneshot, watch};
 use tracing_subscriber::{EnvFilter, fmt::writer::MakeWriterExt, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -20,6 +21,7 @@ pub async fn run(
     shutdown: impl Future<Output = ()> + Send + 'static,
     log_to_console: bool,
 ) -> Result<()> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let mut config = Config::load(config_path)?;
     let logging_directory = config.logging.directory.clone();
     let _log_guard = init_logging(&config.logging.directory, log_to_console)?;
@@ -41,29 +43,40 @@ pub async fn run(
         .await?;
         let cleanup_task = store.spawn_cleanup();
 
-        let address = listen_address(&config.server.host, config.server.port);
-        let listener = tokio::net::TcpListener::bind(&address)
-            .await
-            .with_context(|| format!("无法监听 {address}"))?;
+        let address = SocketAddr::new(config.server.host, config.server.port);
         tracing::info!(%address, config = %config.source_path.display(), "command-api 已启动");
 
         let (management_tx, mut management_rx) = mpsc::channel(1);
         let application = app::build(&config, store.clone(), management_tx);
+        let service = application.into_make_service_with_connect_info::<SocketAddr>();
+        let handle = axum_server::Handle::new();
+        let server: Pin<Box<dyn Future<Output = std::io::Result<()>> + Send>> = match &config.tls {
+            Some(tls) => {
+                let tls = load_tls_config(tls)?;
+                Box::pin(
+                    axum_server::bind_rustls(address, tls)
+                        .handle(handle.clone())
+                        .serve(service),
+                )
+            }
+            None => Box::pin(axum_server::bind(address).handle(handle.clone()).serve(service)),
+        };
         let mut external_shutdown_rx = external_shutdown_rx.clone();
         let (action_tx, action_rx) = oneshot::channel();
-        let server_result = axum::serve(listener, application)
-            .with_graceful_shutdown(async move {
-                let action = if *external_shutdown_rx.borrow() {
-                    ManagementAction::Stop
-                } else {
-                    tokio::select! {
-                        _ = external_shutdown_rx.changed() => ManagementAction::Stop,
-                        action = management_rx.recv() => action.unwrap_or(ManagementAction::Stop),
-                    }
-                };
-                let _ = action_tx.send(action);
-            })
-            .await;
+        tokio::spawn(async move {
+            let action = if *external_shutdown_rx.borrow() {
+                ManagementAction::Stop
+            } else {
+                tokio::select! {
+                    _ = external_shutdown_rx.changed() => ManagementAction::Stop,
+                    action = management_rx.recv() => action.unwrap_or(ManagementAction::Stop),
+                }
+            };
+            let _ = action_tx.send(action);
+            handle.graceful_shutdown(None);
+        });
+        let server_result = server.await;
+        server_result.context("HTTP 服务异常退出")?;
         let action = action_rx.await.unwrap_or(ManagementAction::Stop);
         let stop_reason = if matches!(&action, ManagementAction::Restart(_)) {
             StopReason::ServerRestart
@@ -88,7 +101,6 @@ pub async fn run(
         }
         cleanup_task.abort();
         let _ = cleanup_task.await;
-        server_result.context("HTTP 服务异常退出")?;
         drop(store);
 
         match action {
@@ -150,21 +162,72 @@ fn init_logging(directory: &Path, log_to_console: bool) -> Result<tracing_append
     Ok(guard)
 }
 
-fn listen_address(host: &str, port: u16) -> String {
-    if host.contains(':') && !host.starts_with('[') {
-        format!("[{host}]:{port}")
-    } else {
-        format!("{host}:{port}")
+fn load_tls_config(config: &ResolvedTlsConfig) -> Result<axum_server::tls_rustls::RustlsConfig> {
+    let mut certificate_reader = BufReader::new(
+        File::open(&config.certificate)
+            .with_context(|| format!("无法读取 TLS 服务器证书 {}", config.certificate.display()))?,
+    );
+    let certificates = rustls_pemfile::certs(&mut certificate_reader)
+        .collect::<std::io::Result<Vec<_>>>()
+        .context("无法解析 TLS 服务器证书")?;
+    if certificates.is_empty() {
+        bail!("TLS 服务器证书为空");
     }
+
+    let mut private_key_reader = BufReader::new(
+        File::open(&config.private_key)
+            .with_context(|| format!("无法读取 TLS 服务器私钥 {}", config.private_key.display()))?,
+    );
+    let private_key = rustls_pemfile::private_key(&mut private_key_reader)
+        .context("无法解析 TLS 服务器私钥")?
+        .context("TLS 服务器私钥为空")?;
+
+    let mut client_ca_reader = BufReader::new(
+        File::open(&config.client_ca_certificate)
+            .with_context(|| format!("无法读取 TLS 客户端 CA {}", config.client_ca_certificate.display()))?,
+    );
+    let mut client_roots = RootCertStore::empty();
+    for certificate in rustls_pemfile::certs(&mut client_ca_reader) {
+        client_roots.add(certificate.context("无法解析 TLS 客户端 CA")?)?;
+    }
+    if client_roots.is_empty() {
+        bail!("TLS 客户端 CA 证书为空");
+    }
+    let verifier = WebPkiClientVerifier::builder(Arc::new(client_roots)).build()?;
+    let mut server = RustlsServerConfig::builder()
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(certificates, private_key)
+        .context("TLS 服务器证书与私钥不匹配")?;
+    server.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(server)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rcgen::{CertifiedKey, generate_simple_self_signed};
 
     #[test]
-    fn formats_ipv6_listen_address() {
-        assert_eq!(listen_address("0.0.0.0", 27415), "0.0.0.0:27415");
-        assert_eq!(listen_address("::", 27415), "[::]:27415");
+    fn formats_ipv6_socket_address() {
+        assert_eq!(
+            SocketAddr::new("::1".parse().unwrap(), 27415).to_string(),
+            "[::1]:27415"
+        );
+    }
+
+    #[test]
+    fn loads_matching_pem_certificate_key_and_client_ca() {
+        let temp = tempfile::tempdir().unwrap();
+        let CertifiedKey { cert, signing_key } = generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+        let certificate = temp.path().join("server.crt");
+        let private_key = temp.path().join("server.key");
+        std::fs::write(&certificate, cert.pem()).unwrap();
+        std::fs::write(&private_key, signing_key.serialize_pem()).unwrap();
+        let config = ResolvedTlsConfig {
+            certificate: certificate.clone(),
+            private_key,
+            client_ca_certificate: certificate,
+        };
+        load_tls_config(&config).unwrap();
     }
 }

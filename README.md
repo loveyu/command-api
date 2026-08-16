@@ -2,6 +2,8 @@
 
 `command-api` 将配置文件中预先声明的脚本暴露为带 Token 鉴权的异步 HTTP API。它只执行配置允许的脚本，支持逐路由和全局并发限制、动态 argv 参数、执行超时、平滑/强制终止进程树、输出持久化、任务状态查询以及服务停止和运行时重启。
 
+> **安全边界**：本服务只适用于受控内网，禁止直接或通过 NAT 端口转发、反向代理暴露到公网。程序拒绝公网 IP、`0.0.0.0`、`::` 监听以及公网 CIDR；非 loopback 监听强制启用 mTLS。
+
 项目地址：<https://github.com/loveyu/command-api>
 
 ## 平台支持
@@ -17,7 +19,7 @@ Linux 使用独立进程组管理脚本及子进程；Windows 使用 Job Object�
 
 ## 配置
 
-复制示例配置并修改 Token：
+复制示例配置，并准备环境变量 Token 或 Windows DPAPI 密钥：
 
 ```bash
 cp config.example.yaml config.yaml
@@ -27,11 +29,26 @@ cp config.example.yaml config.yaml
 
 ```yaml
 server:
-  host: 0.0.0.0
+  host: 10.132.1.145
   port: 27415
 
+access:
+  allowed_cidrs:
+    - 10.132.1.1/32
+  token_failure_cooldown:
+    enabled: true
+    seconds: 10
+    max_tracked_ips: 4096
+
+tls:
+  certificate: ./tls/server.crt
+  private_key: ./tls/server.key
+  client_ca_certificate: ./tls/client-ca.crt
+
 auth:
-  token: replace-with-a-strong-random-token
+  token:
+    provider: windows_dpapi
+    file: ./secrets/token.dpapi
 
 logging:
   directory: ./logs
@@ -52,6 +69,8 @@ routes:
       max_count: 32
       max_item_bytes: 4096
       max_total_bytes: 16384
+      allowed_values: [status]
+      allowed_patterns: ['^[A-Za-z0-9._-]{1,64}$']
     max_concurrency: 2
     max_execution_seconds: 300
     graceful_shutdown_seconds: 10
@@ -59,7 +78,42 @@ routes:
     output_encoding: utf-8
 ```
 
-相对的脚本路径、工作目录和日志目录均相对于配置文件所在目录解析。配置会在启动时校验，脚本不存在、路由冲突、限制为零或 `cmd` 启用动态参数时拒绝启动。配置修改后可以调用运行时重启接口重新加载；`logging.directory` 是例外，修改它需要先停止服务，再通过命令行或外部服务管理器启动。
+相对的脚本、工作目录、日志、证书和 DPAPI 密钥路径均相对于配置文件所在目录解析。配置会在启动时校验；明文 Token、空 CIDR、公网监听/网段、非 loopback 未配置 mTLS、脚本不存在、路由冲突、限制为零或 `cmd` 启用动态参数时都会拒绝启动。配置修改后可以调用运行时重启接口重新加载；`logging.directory` 是例外，修改它需要先停止服务，再通过命令行或外部服务管理器启动。
+
+`allowed_values` 和 `allowed_patterns` 对每个请求参数执行允许值/正则校验；两者同时配置时，参数满足任一规则即可。LocalSystem 服务的路由只要启用动态参数，就必须至少配置其中一种规则。
+
+### Token 密钥
+
+YAML 不接受明文 Token，只支持以下提供器：
+
+```yaml
+# 跨平台：从进程环境读取
+auth:
+  token:
+    provider: environment
+    variable: COMMAND_API_TOKEN
+
+# Windows：从 DPAPI 密文文件读取
+auth:
+  token:
+    provider: windows_dpapi
+    file: ./secrets/token.dpapi
+```
+
+Windows 可以生成强随机 Token，并按当前用户或整机作用域保护：
+
+```powershell
+command-api.exe secret generate --scope user --output C:\command-api\secrets\token.dpapi
+command-api.exe secret protect --scope machine --output C:\command-api\secrets\token.dpapi
+```
+
+`generate` 仅在标准输出显示一次 Token；应立即保存到调用端的密钥存储，避免终端历史和日志。`user` 密文只能由同一 Windows 用户在同一机器解密；`machine` 密文可被同机用户解密，因此必须通过 NTFS ACL 限制密钥文件。两个实例应使用不同 Token。
+
+### CIDR 与认证失败冷却
+
+`access.allowed_cidrs` 必须包含一个或多个 IPv4/IPv6 CIDR。服务仅使用 TCP 对端地址，不信任 `X-Forwarded-For` 等可伪造头。来源不在白名单时返回 `403`。
+
+启用 `token_failure_cooldown` 后，第一次 Token 失败返回 `401` 并按来源 IP 记录冷却；冷却期内后续请求直接返回 `429` 和 `Retry-After`，不会再次校验 Token、解析请求或触发脚本。共享同一 NAT 出口的客户端也会共享冷却状态。
 
 解释器支持：
 
@@ -89,7 +143,7 @@ command-api run --config /absolute/path/config.yaml
 command-api.exe run --config C:\command-api\config.yaml
 ```
 
-实际配置文件包含 Token，不应提交到 Git。日志目录必须只有服务账户和管理员可读写。
+实际配置文件不包含明文 Token，但配置、DPAPI 密钥、TLS 私钥和日志仍不得提交到 Git，并必须只允许对应服务账户和管理员访问。
 
 ## 鉴权与接口
 
@@ -99,13 +153,14 @@ command-api.exe run --config C:\command-api\config.yaml
 Authorization: Bearer <token>
 ```
 
-Token 不支持通过 URL 查询参数传递，以免出现在代理日志和浏览器历史中。该 Token 同时拥有脚本执行、任务强制终止和服务启停权限，应按管理密钥保护，并在反向代理或防火墙中限制调用来源。
+Token 不支持通过 URL 查询参数传递，以免出现在日志和浏览器历史中。该 Token 同时拥有脚本执行、任务强制终止和服务启停权限，应按管理密钥保护，并同时使用 mTLS、应用层 CIDR 和系统防火墙限制调用来源。
 
 ### 创建任务
 
 ```bash
-curl -sS -X POST http://127.0.0.1:27415/commands/example-shell \
-  -H 'Authorization: Bearer replace-with-a-strong-random-token' \
+curl -sS -X POST https://10.132.1.145:27415/commands/example-shell \
+  --cacert ca.crt --cert client.crt --key client.key \
+  -H 'Authorization: Bearer <token>' \
   -H 'Content-Type: application/json' \
   -d '{"args":["hello world","--verbose"]}'
 ```
@@ -126,7 +181,8 @@ curl -sS -X POST http://127.0.0.1:27415/commands/example-shell \
 ### 查询任务
 
 ```bash
-curl -sS http://127.0.0.1:27415/tasks/<task-id> \
+curl -sS https://10.132.1.145:27415/tasks/<task-id> \
+  --cacert ca.crt --cert client.crt --key client.key \
   -H 'Authorization: Bearer <token>'
 ```
 
@@ -208,9 +264,21 @@ command-api.exe service stop --config C:\command-api\config.yaml
 command-api.exe service uninstall --config C:\command-api\config.yaml
 ```
 
-安装命令注册为自动启动的 `LocalService`。必须提前为 `NT AUTHORITY\LOCAL SERVICE` 授予二进制、配置和脚本的读取权限，以及日志目录的修改权限。需要访问网络共享或其他用户资源时，应由管理员在 Windows 服务管理器中修改服务账户；程序不接收或保存服务账户密码。
+服务账户由 `windows_service.account` 选择：默认 `local_service`，确有高权限脚本需求时可显式设置 `local_system`。程序不接收或保存 Windows 账户密码。LocalSystem 拥有极高本机权限，必须使用独立 Token、端口、配置、日志和严格参数规则，并把路由缩减到必要的系统操作。
 
-Service 使用配置文件绝对路径，不依赖 Windows Service 默认的 `C:\Windows\System32` 工作目录。SCM 停止事件、命令行 Ctrl+C 和 `/system/stop` 使用同一套任务平滑退出和强制清理流程。`/system/restart` 在现有 Windows Service 进程内重建 HTTP 运行时，因此不需要 LocalService 账户拥有额外的 SCM 服务启动权限。
+必须提前为所选服务账户授予二进制、配置、脚本、证书的读取权限，以及日志目录的修改权限；TLS 私钥和 DPAPI 密钥只允许所选服务账户与 Administrators 读取。
+
+Service 使用配置文件绝对路径，不依赖 Windows Service 默认的 `C:\Windows\System32` 工作目录。SCM 停止事件、命令行 Ctrl+C 和 `/system/stop` 使用同一套任务平滑退出和强制清理流程。`/system/restart` 在现有 Windows Service 进程内重建 HTTP 运行时，因此不需要服务账户拥有额外的 SCM 启动权限。
+
+## Windows 登录用户桌面实例
+
+需要访问用户桌面、HKCU 或交互会话时，使用独立配置执行普通前台进程：
+
+```powershell
+command-api.exe run --config "$env:LOCALAPPDATA\CommandApi\user\config.yaml"
+```
+
+自动随登录启动时，使用 Task Scheduler 的登录触发器和交互式用户令牌，并选择“仅当用户登录时运行”；不要保存登录密码，也不要默认启用“使用最高权限运行”。桌面实例必须与系统服务使用不同端口、Token、日志目录和路由集合。
 
 ## Docker
 
@@ -219,7 +287,7 @@ Docker 镜像不包含 Token 配置和业务脚本，需要只读挂载配置/�
 ```bash
 cargo build --release --locked
 docker build -t command-api:local .
-docker run --rm -p 27415:27415 \
+docker run --rm -p 127.0.0.1:27415:27415 \
   -v "$PWD/config.yaml:/etc/command-api/config.yaml:ro" \
   -v "$PWD/scripts:/etc/command-api/scripts:ro" \
   -v "$PWD/logs:/var/log/command-api" \

@@ -1,9 +1,32 @@
 server:
-  host: 0.0.0.0
+  # 必须是明确的私有、loopback 或 link-local IP；禁止 0.0.0.0、:: 和公网地址。
+  host: 192.168.1.10
   port: 27415
 
+access:
+  # 至少一个 CIDR，且只能使用私有、loopback 或 link-local 网段。
+  allowed_cidrs:
+    - 192.168.1.0/24
+  token_failure_cooldown:
+    enabled: true
+    seconds: 10
+    max_tracked_ips: 4096
+
+# 非 loopback 监听必须启用 mTLS。证书和私钥路径相对于本配置文件。
+tls:
+  certificate: ./tls/server.crt
+  private_key: ./tls/server.key
+  client_ca_certificate: ./tls/client-ca.crt
+
 auth:
-  token: replace-with-a-strong-random-token
+  # 跨平台可从进程环境读取，不允许在 YAML 中直接保存 Token。
+  token:
+    provider: environment
+    variable: COMMAND_API_TOKEN
+  # Windows 推荐改用以下 DPAPI 密钥文件：
+  # token:
+  #   provider: windows_dpapi
+  #   file: ./secrets/token.dpapi
 
 logging:
   directory: ./logs
@@ -18,6 +41,7 @@ windows_service:
   name: command-api
   display_name: Command API
   description: 通过受控 HTTP API 异步执行预配置脚本
+  account: local_service
 
 routes:
   # Linux/macOS，或已经安装 bash 的 Windows 环境。
@@ -31,6 +55,8 @@ routes:
       max_count: 32
       max_item_bytes: 4096
       max_total_bytes: 16384
+      allowed_patterns:
+        - '^[A-Za-z0-9._ -]{1,128}$'
     max_concurrency: 2
     max_execution_seconds: 300
     graceful_shutdown_seconds: 10
@@ -48,6 +74,8 @@ routes:
       max_count: 32
       max_item_bytes: 4096
       max_total_bytes: 16384
+      allowed_patterns:
+        - '^[A-Za-z0-9._ -]{1,128}$'
     max_concurrency: 2
     max_execution_seconds: 300
     graceful_shutdown_seconds: 10

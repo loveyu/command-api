@@ -1,6 +1,6 @@
 [package]
 name = "command-api"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "通过受控 HTTP API 异步执行预配置脚本"
 repository = "https://github.com/loveyu/command-api"
@@ -8,11 +8,17 @@ repository = "https://github.com/loveyu/command-api"
 [dependencies]
 anyhow = "1"
 axum = "0.8"
+axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 encoding_rs = "0.8"
 fs2 = "0.4"
+ipnet = { version = "2", features = ["serde"] }
 os_pipe = "1"
+regex = "1"
+rpassword = "7"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
@@ -25,6 +31,7 @@ tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 uuid = { version = "1", features = ["serde", "v4"] }
+zeroize = "1"
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.30", features = ["process", "signal"] }
@@ -33,13 +40,16 @@ nix = { version = "0.30", features = ["process", "signal"] }
 windows-service = "0.8"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
+    "Win32_Security_Cryptography",
     "Win32_System_Console",
     "Win32_System_JobObjects",
+    "Win32_System_Memory",
     "Win32_System_Threading",
     "Win32_UI_WindowsAndMessaging",
 ] }
 
 [dev-dependencies]
-reqwest = { version = "0.13", default-features = false, features = ["json"] }
+rcgen = "0.14"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }

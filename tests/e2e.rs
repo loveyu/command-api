@@ -1,10 +1,12 @@
-use reqwest::{Client, StatusCode};
+use rcgen::{BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose};
+use reqwest::{Certificate, Client, Identity, StatusCode};
 use serde_json::{Value, json};
 use std::{
     fs,
     net::TcpListener,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
+    sync::Once,
     time::Duration,
 };
 use tempfile::TempDir;
@@ -18,7 +20,23 @@ struct Server {
     token: String,
 }
 
+struct TlsServer {
+    child: Child,
+    _temp: TempDir,
+    base_url: String,
+    token: String,
+    ca_pem: Vec<u8>,
+    client_identity_pem: Vec<u8>,
+}
+
 impl Drop for Server {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Drop for TlsServer {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -27,6 +45,9 @@ impl Drop for Server {
 
 impl Server {
     async fn start() -> Self {
+        install_crypto_provider();
+        const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        const RELOADED_TOKEN: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
         let temp = tempfile::tempdir().unwrap();
         let port = free_port();
         let (executor, script_name, script) = test_script();
@@ -39,8 +60,13 @@ impl Server {
                 r#"server:
   host: 127.0.0.1
   port: {port}
+access:
+  allowed_cidrs:
+    - 127.0.0.0/8
 auth:
-  token: integration-secret
+  token:
+    provider: environment
+    variable: COMMAND_API_E2E_TOKEN
 logging:
   directory: ./logs
   retention_seconds: 3600
@@ -90,6 +116,8 @@ routes:
             .arg("run")
             .arg("--config")
             .arg(&config_path)
+            .env("COMMAND_API_E2E_TOKEN", TOKEN)
+            .env("COMMAND_API_E2E_TOKEN_RELOADED", RELOADED_TOKEN)
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
             .spawn()
@@ -100,7 +128,7 @@ routes:
             base_url: format!("http://127.0.0.1:{port}"),
             client: Client::new(),
             config_path,
-            token: "integration-secret".to_owned(),
+            token: TOKEN.to_owned(),
         };
         server.wait_ready().await;
         server
@@ -183,6 +211,99 @@ routes:
     }
 }
 
+impl TlsServer {
+    async fn start() -> Self {
+        install_crypto_provider();
+        const TOKEN: &str = "123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0";
+        let temp = tempfile::tempdir().unwrap();
+        let port = free_port();
+        let (executor, script_name, script) = test_script();
+        let script_path = temp.path().join(script_name);
+        fs::write(&script_path, script).unwrap();
+        let (ca_pem, server_certificate, server_key, client_identity_pem) = test_pki();
+        fs::write(temp.path().join("ca.crt"), &ca_pem).unwrap();
+        fs::write(temp.path().join("server.crt"), server_certificate).unwrap();
+        fs::write(temp.path().join("server.key"), server_key).unwrap();
+        let config_path = temp.path().join("config.yaml");
+        fs::write(
+            &config_path,
+            format!(
+                r#"server:
+  host: 127.0.0.1
+  port: {port}
+access:
+  allowed_cidrs: [127.0.0.0/8]
+tls:
+  certificate: ./server.crt
+  private_key: ./server.key
+  client_ca_certificate: ./ca.crt
+auth:
+  token:
+    provider: environment
+    variable: COMMAND_API_TLS_TEST_TOKEN
+logging:
+  directory: ./logs
+routes:
+  - path: /run
+    executor: {executor}
+    script: {script}
+    max_concurrency: 1
+    max_execution_seconds: 5
+    graceful_shutdown_seconds: 1
+"#,
+                script = yaml_path(&script_path),
+            ),
+        )
+        .unwrap();
+        let child = Command::new(env!("CARGO_BIN_EXE_command-api"))
+            .arg("run")
+            .arg("--config")
+            .arg(&config_path)
+            .env("COMMAND_API_TLS_TEST_TOKEN", TOKEN)
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap();
+        let server = Self {
+            child,
+            _temp: temp,
+            base_url: format!("https://127.0.0.1:{port}"),
+            token: TOKEN.to_owned(),
+            ca_pem,
+            client_identity_pem,
+        };
+        server.wait_ready().await;
+        server
+    }
+
+    fn client(&self, with_identity: bool) -> Client {
+        let mut builder = Client::builder()
+            .add_root_certificate(Certificate::from_pem(&self.ca_pem).unwrap())
+            .tls_backend_rustls();
+        if with_identity {
+            builder = builder.identity(Identity::from_pem(&self.client_identity_pem).unwrap());
+        }
+        builder.build().unwrap()
+    }
+
+    async fn wait_ready(&self) {
+        let client = self.client(true);
+        for _ in 0..100 {
+            if client
+                .get(format!("{}/healthz", self.base_url))
+                .bearer_auth(&self.token)
+                .send()
+                .await
+                .is_ok_and(|response| response.status() == StatusCode::OK)
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("mTLS command-api did not become ready");
+    }
+}
+
 #[tokio::test]
 async fn executes_arguments_captures_streams_merges_and_times_out() {
     let server = Server::start().await;
@@ -227,7 +348,7 @@ async fn executes_arguments_captures_streams_merges_and_times_out() {
     let cancel = server
         .client
         .post(format!("{}/tasks/{cancellable_id}/cancel", server.base_url))
-        .bearer_auth("integration-secret")
+        .bearer_auth(&server.token)
         .send()
         .await
         .unwrap();
@@ -240,7 +361,7 @@ async fn executes_arguments_captures_streams_merges_and_times_out() {
     let kill = server
         .client
         .post(format!("{}/tasks/{kill_id}/kill", server.base_url))
-        .bearer_auth("integration-secret")
+        .bearer_auth(&server.token)
         .send()
         .await
         .unwrap();
@@ -276,13 +397,16 @@ async fn validates_restart_configuration_restarts_and_stops() {
     let invalid_restart = server
         .client
         .post(format!("{}/system/restart", server.base_url))
-        .bearer_auth("integration-secret")
+        .bearer_auth(&server.token)
         .send()
         .await
         .unwrap();
     assert_eq!(invalid_restart.status(), StatusCode::CONFLICT);
     server.wait_ready().await;
-    let reloaded_config = valid_config.replace("token: integration-secret", "token: integration-secret-reloaded");
+    let reloaded_config = valid_config.replace(
+        "variable: COMMAND_API_E2E_TOKEN",
+        "variable: COMMAND_API_E2E_TOKEN_RELOADED",
+    );
     fs::write(&server.config_path, reloaded_config).unwrap();
 
     let response = server.execute("/run", &["sleep", "30"]).await;
@@ -296,7 +420,7 @@ async fn validates_restart_configuration_restarts_and_stops() {
         .await
         .unwrap();
     assert_eq!(restart.status(), StatusCode::ACCEPTED);
-    server.token = "integration-secret-reloaded".to_owned();
+    server.token = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".to_owned();
 
     let interrupted = server.wait_finished(interrupted_id).await;
     assert_eq!(interrupted["status"], "interrupted");
@@ -319,6 +443,65 @@ async fn validates_restart_configuration_restarts_and_stops() {
         .unwrap();
     assert_eq!(stop.status(), StatusCode::ACCEPTED);
     server.wait_process_exit().await;
+}
+
+#[tokio::test]
+async fn requires_a_trusted_mtls_client_certificate() {
+    let server = TlsServer::start().await;
+    let without_identity = server
+        .client(false)
+        .get(format!("{}/healthz", server.base_url))
+        .bearer_auth(&server.token)
+        .send()
+        .await;
+    assert!(without_identity.is_err());
+
+    let valid = server
+        .client(true)
+        .get(format!("{}/healthz", server.base_url))
+        .bearer_auth(&server.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(valid.status(), StatusCode::OK);
+}
+
+fn test_pki() -> (Vec<u8>, String, String, Vec<u8>) {
+    let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params.key_usages = vec![
+        KeyUsagePurpose::DigitalSignature,
+        KeyUsagePurpose::KeyCertSign,
+        KeyUsagePurpose::CrlSign,
+    ];
+    let ca_key = KeyPair::generate().unwrap();
+    let ca_certificate = ca_params.self_signed(&ca_key).unwrap();
+    let ca_pem = ca_certificate.pem().into_bytes();
+    let issuer = Issuer::new(ca_params, ca_key);
+
+    let mut server_params = CertificateParams::new(vec!["127.0.0.1".to_owned()]).unwrap();
+    server_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    server_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    let server_key = KeyPair::generate().unwrap();
+    let server_certificate = server_params.signed_by(&server_key, &issuer).unwrap().pem();
+    let server_key = server_key.serialize_pem();
+
+    let mut client_params = CertificateParams::new(vec!["command-api-test-client".to_owned()]).unwrap();
+    client_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    client_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+    let client_key = KeyPair::generate().unwrap();
+    let client_certificate = client_params.signed_by(&client_key, &issuer).unwrap().pem();
+    let client_identity = format!("{client_certificate}{}", client_key.serialize_pem()).into_bytes();
+    (ca_pem, server_certificate, server_key, client_identity)
+}
+
+fn install_crypto_provider() {
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| {
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .expect("install rustls ring provider");
+    });
 }
 
 fn free_port() -> u16 {
